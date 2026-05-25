@@ -1,2 +1,6 @@
 __pycache__/
-output
+outputsubmodules/diff-gaussian-rasterization/third_party/
+submodules/*/build/
+submodules/*/*.egg-info/
+submodules/*/diff_gaussian_rasterization/*.so
+submodules/*/simple_knn/*.so
