@@ -1,0 +1,4 @@
+# ninja log v7
+1	28690	1778536403236522000	/rds/general/ephemeral/user/ka1525/ephemeral/models/E-D3DGS-Stereo/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	8423b1c8669277cb
+1	36303	1778536403236872000	/rds/general/ephemeral/user/ka1525/ephemeral/models/E-D3DGS-Stereo/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	5e157223ef3aace
+1	135573	1778536403237084000	/rds/general/ephemeral/user/ka1525/ephemeral/models/E-D3DGS-Stereo/submodules/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	a9c99340dbdfcb92
