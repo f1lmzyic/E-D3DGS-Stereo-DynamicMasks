@@ -59,6 +59,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._embedding = torch.empty(0)
+        self._foreground_logits = torch.empty(0)
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -79,6 +80,7 @@ class GaussianModel:
             self._rotation,
             self._opacity,
             self._embedding,
+            self._foreground_logits,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -87,24 +89,45 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._deformation,
-        self._features_dc, 
-        self._features_rest,
-        self._embedding,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) == 15:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._deformation,
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self._embedding,
+            self._foreground_logits,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
+        else:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._deformation,
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self._embedding,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
+            self._foreground_logits = nn.Parameter(inverse_sigmoid(0.01 * torch.ones((self._xyz.shape[0], 1), dtype=torch.float, device="cuda")).requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+        except ValueError as exc:
+            print(f"[WARN] Could not load optimizer state ({exc}); continuing with fresh optimizer state.")
 
     @property
     def get_scaling(self):
@@ -136,6 +159,12 @@ class GaussianModel:
     @property
     def get_embedding(self):
         return self._embedding
+
+    @property
+    def get_foreground_prob(self):
+        if self._foreground_logits.numel() == 0:
+            return torch.zeros((self.get_xyz.shape[0], 1), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
+        return torch.sigmoid(self._foreground_logits)
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -163,6 +192,7 @@ class GaussianModel:
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         embedding = torch.zeros((fused_color.shape[0], self._deformation.gaussian_embedding_dim)).float().cuda()  # [jm]
+        foreground_logits = inverse_sigmoid(0.01 * torch.ones((fused_color.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._deformation = self._deformation.to("cuda") 
@@ -172,6 +202,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._embedding = nn.Parameter(embedding.requires_grad_(True))  # [jm]
+        self._foreground_logits = nn.Parameter(foreground_logits.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -188,7 +219,8 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._embedding], 'lr': training_args.feature_lr, "name": "embedding"}
+            {'params': [self._embedding], 'lr': training_args.feature_lr, "name": "embedding"},
+            {'params': [self._foreground_logits], 'lr': training_args.opacity_lr, "name": "foreground_logits"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -225,6 +257,7 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         for i in range(self._embedding.shape[1]):
             l.append('embedding_{}'.format(i))
+        l.append('foreground_logit')
         return l
 
     def load_model(self, path):
@@ -252,7 +285,8 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, embedding), axis=1)
+        foreground_logits = self._foreground_logits.detach().cpu().numpy() if self._foreground_logits.numel() else np.zeros((xyz.shape[0], 1), dtype=np.float32)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, embedding, foreground_logits), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -305,6 +339,10 @@ class GaussianModel:
         embeddings = np.zeros((xyz.shape[0], len(embedding_names)))
         for idx, attr_name in enumerate(embedding_names):
             embeddings[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        if "foreground_logit" in plydata.elements[0].data.dtype.names:
+            foreground_logits = np.asarray(plydata.elements[0]["foreground_logit"])[..., np.newaxis]
+        else:
+            foreground_logits = inverse_sigmoid(0.01 * torch.ones((xyz.shape[0], 1), dtype=torch.float)).numpy()
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -313,6 +351,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._embedding = nn.Parameter(torch.tensor(embeddings, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._foreground_logits = nn.Parameter(torch.tensor(foreground_logits, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -361,9 +400,33 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._embedding = optimizable_tensors["embedding"]
+        self._foreground_logits = optimizable_tensors["foreground_logits"]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+    def enforce_max_points(self, max_points):
+        """Hard-cap point count by pruning lowest opacity/foreground-score Gaussians.
+
+        densify(max_points=...) only stops adding new points; it does not reduce an
+        already oversized checkpoint/model. This keeps training under GPU memory.
+        """
+        max_points = int(max_points)
+        n = self.get_xyz.shape[0]
+        if max_points <= 0 or n <= max_points:
+            return 0
+        with torch.no_grad():
+            score = self.get_opacity.squeeze()
+            if self._foreground_logits.numel() == n:
+                score = score + 0.1 * self.get_foreground_prob.squeeze()
+            keep = torch.topk(score, k=max_points, largest=True, sorted=False).indices
+            valid = torch.zeros(n, dtype=torch.bool, device=self.get_xyz.device)
+            valid[keep] = True
+            prune_mask = ~valid
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+        print(f"[POINT CAP] pruned {n - max_points} Gaussians; kept {max_points}")
+        return n - max_points
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -388,7 +451,27 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding):
+    def add_seed_points(self, new_xyz, new_rgb, scale=0.01, opacity=0.2, foreground_prob=0.9):
+        if new_xyz is None or new_xyz.numel() == 0:
+            return
+        new_xyz = new_xyz.detach().float().cuda()
+        new_rgb = new_rgb.detach().float().cuda().clamp(0.0, 1.0)
+        fused_color = RGB2SH(new_rgb)
+        features = torch.zeros((new_xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2), dtype=torch.float, device="cuda")
+        features[:, :3, 0] = fused_color
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+        new_opacities = inverse_sigmoid(float(opacity) * torch.ones((new_xyz.shape[0], 1), dtype=torch.float, device="cuda"))
+        new_scaling = torch.log(float(scale) * torch.ones((new_xyz.shape[0], 3), dtype=torch.float, device="cuda"))
+        new_rotation = torch.zeros((new_xyz.shape[0], 4), dtype=torch.float, device="cuda")
+        new_rotation[:, 0] = 1.0
+        new_embedding = torch.zeros((new_xyz.shape[0], self._deformation.gaussian_embedding_dim), dtype=torch.float, device="cuda")
+        new_foreground_logits = inverse_sigmoid(float(foreground_prob) * torch.ones((new_xyz.shape[0], 1), dtype=torch.float, device="cuda"))
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding, new_foreground_logits)
+
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding, new_foreground_logits=None):
+        if new_foreground_logits is None:
+            new_foreground_logits = inverse_sigmoid(0.01 * torch.ones((new_xyz.shape[0], 1), dtype=torch.float, device="cuda"))
         d = {"xyz": new_xyz, 
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -396,6 +479,7 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         "embedding" : new_embedding,
+        "foreground_logits": new_foreground_logits,
        }
         
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -406,6 +490,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._embedding = optimizable_tensors["embedding"]
+        self._foreground_logits = optimizable_tensors["foreground_logits"]
         
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -432,7 +517,8 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_embedding = self._embedding[selected_pts_mask].repeat(N,1)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_embedding)
+        new_foreground_logits = self._foreground_logits[selected_pts_mask].repeat(N,1)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_embedding, new_foreground_logits)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -450,9 +536,10 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_embedding = self._embedding[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding)
+        new_foreground_logits = self._foreground_logits[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding, new_foreground_logits)
 
-    def prune(self, max_grad, min_opacity, extent, max_screen_size, use_mean=False):
+    def prune(self, max_grad, min_opacity, extent, max_screen_size, use_mean=False, protect_mask=None):
         if use_mean:
             prune_mask = (self.get_opacity < (self.get_opacity.max() - (self.get_opacity.max() - self.get_opacity.min())*0.5) ).squeeze()        
         else:
@@ -463,6 +550,10 @@ class GaussianModel:
             prune_mask = torch.logical_or(prune_mask, big_points_vs)
 
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if protect_mask is not None:
+            protect_mask = protect_mask.to(device=prune_mask.device, dtype=torch.bool)
+            if protect_mask.shape[0] == prune_mask.shape[0]:
+                prune_mask = torch.logical_and(prune_mask, ~protect_mask)
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 

@@ -4,3 +4,5 @@ submodules/*/build/
 submodules/*/*.egg-info/
 submodules/*/diff_gaussian_rasterization/*.so
 submodules/*/simple_knn/*.so
+output/
+.ipynb_checkpoints/

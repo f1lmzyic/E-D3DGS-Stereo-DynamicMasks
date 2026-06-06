@@ -14,6 +14,7 @@ from glob import glob
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 from PIL import Image
 from tqdm import tqdm
@@ -71,6 +72,54 @@ def create_stereo_camera(R, T, ipd=0.12, convergence_distance=0.0):
 
     T_right = -(R_right.T @ right_center)
     return R_right.astype(R.dtype, copy=False), T_right.astype(T.dtype, copy=False)
+
+
+def _prepare_dynamic_right_mask(view, rendering_left, dilate=3, blur=1.0, shift_px=0, threshold=0.5, min_area=0.0001, max_area=0.12):
+    """Return a soft 1xHxW mask for compositing dynamic regions into the right view.
+
+    In monocular-to-stereo rendering, dynamic masked objects are only supervised in
+    the left/source view. Novel right-eye disocclusions around those objects can
+    therefore look broken. This mask lets us keep dynamic objects from the left
+    render while using the shifted right render elsewhere.
+    """
+    mask = getattr(view, "dynamic_mask", None)
+    if mask is None:
+        return None
+    mask = mask.to(device=rendering_left.device, dtype=rendering_left.dtype)
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    mask = mask[:1].unsqueeze(0)
+    if mask.shape[-2:] != rendering_left.shape[-2:]:
+        mask = F.interpolate(mask, size=rendering_left.shape[-2:], mode="bilinear", align_corners=False)
+
+    # Diff heatmaps or over-dilated masks can cover huge parts of the frame. That
+    # causes left/right ghosting in the right eye, so gate the mask aggressively.
+    mask = (mask >= threshold).to(mask.dtype)
+    area = float(mask.mean().detach().cpu())
+    if area < min_area or area > max_area:
+        return None
+
+    if dilate and dilate > 1:
+        k = int(dilate)
+        if k % 2 == 0:
+            k += 1
+        mask = F.max_pool2d(mask, kernel_size=k, stride=1, padding=k // 2)
+    if shift_px:
+        mask = torch.roll(mask, shifts=int(shift_px), dims=-1)
+        if shift_px > 0:
+            mask[..., :shift_px] = 0
+        else:
+            mask[..., shift_px:] = 0
+    if blur and blur > 0:
+        # Cheap separable-ish blur via average pooling; enough to avoid hard seams.
+        k = max(3, int(round(blur * 2)) * 2 + 1)
+        mask = F.avg_pool2d(mask, kernel_size=k, stride=1, padding=k // 2)
+
+    # Re-check after dilation; skip if it would overwrite a large chunk of the right view.
+    area_after = float((mask > 0.05).to(mask.dtype).mean().detach().cpu())
+    if area_after > max_area:
+        return None
+    return mask.clamp(0.0, 1.0).squeeze(0)
 
 
 def _apply_extrinsic(view, R, T):
@@ -304,6 +353,12 @@ def render_stereo_set(
     output_format="side_by_side",
     source_path=None,
     fps=30.0,
+    dynamic_right_composite=False,
+    dynamic_right_mask_dilate=3,
+    dynamic_right_mask_blur=1.0,
+    dynamic_right_mask_shift_px=0,
+    dynamic_right_mask_threshold=0.5,
+    dynamic_right_mask_max_area=0.12,
 ):
     stereo_root = os.path.join(model_path, name, f"stereo_{iteration}")
     if os.path.isdir(stereo_root):
@@ -384,6 +439,19 @@ def render_stereo_set(
         view.world_view_transform = wvt_orig
         view.full_proj_transform = fpt_orig
         view.camera_center = cc_orig
+
+        if dynamic_right_composite:
+            dynamic_mask = _prepare_dynamic_right_mask(
+                view,
+                rendering_left,
+                dilate=dynamic_right_mask_dilate,
+                blur=dynamic_right_mask_blur,
+                shift_px=dynamic_right_mask_shift_px,
+                threshold=dynamic_right_mask_threshold,
+                max_area=dynamic_right_mask_max_area,
+            )
+            if dynamic_mask is not None:
+                rendering_right = rendering_right * (1.0 - dynamic_mask) + rendering_left * dynamic_mask
 
         _cuda_sync()
         t1 = time.time()
@@ -477,6 +545,12 @@ def render_stereo_sets(
     output_format: str,
     gt_source_path: str = None,
     fps: float = 30.0,
+    dynamic_right_composite: bool = False,
+    dynamic_right_mask_dilate: int = 3,
+    dynamic_right_mask_blur: float = 1.0,
+    dynamic_right_mask_shift_px: int = 0,
+    dynamic_right_mask_threshold: float = 0.5,
+    dynamic_right_mask_max_area: float = 0.12,
 ):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
@@ -509,6 +583,12 @@ def render_stereo_sets(
                 output_format=output_format,
                 source_path=source_path,
                 fps=fps,
+                dynamic_right_composite=dynamic_right_composite,
+                dynamic_right_mask_dilate=dynamic_right_mask_dilate,
+                dynamic_right_mask_blur=dynamic_right_mask_blur,
+                dynamic_right_mask_shift_px=dynamic_right_mask_shift_px,
+                dynamic_right_mask_threshold=dynamic_right_mask_threshold,
+                dynamic_right_mask_max_area=dynamic_right_mask_max_area,
             )
         if not skip_test:
             render_stereo_set(
@@ -525,6 +605,12 @@ def render_stereo_sets(
                 output_format=output_format,
                 source_path=source_path,
                 fps=fps,
+                dynamic_right_composite=dynamic_right_composite,
+                dynamic_right_mask_dilate=dynamic_right_mask_dilate,
+                dynamic_right_mask_blur=dynamic_right_mask_blur,
+                dynamic_right_mask_shift_px=dynamic_right_mask_shift_px,
+                dynamic_right_mask_threshold=dynamic_right_mask_threshold,
+                dynamic_right_mask_max_area=dynamic_right_mask_max_area,
             )
         if not skip_video:
             render_stereo_set(
@@ -541,6 +627,12 @@ def render_stereo_sets(
                 output_format=output_format,
                 source_path=source_path,
                 fps=fps,
+                dynamic_right_composite=dynamic_right_composite,
+                dynamic_right_mask_dilate=dynamic_right_mask_dilate,
+                dynamic_right_mask_blur=dynamic_right_mask_blur,
+                dynamic_right_mask_shift_px=dynamic_right_mask_shift_px,
+                dynamic_right_mask_threshold=dynamic_right_mask_threshold,
+                dynamic_right_mask_max_area=dynamic_right_mask_max_area,
             )
 
 
@@ -566,6 +658,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--gt_source_path", default=None, type=str, help="Scene root containing images/right GT")
     parser.add_argument("--fps", default=30.0, type=float, help="Output video FPS")
+    parser.add_argument(
+        "--dynamic_right_composite",
+        action="store_true",
+        help="For monocular-to-stereo, composite left-rendered dynamic-mask regions into the generated right view to avoid right-eye disocclusion holes on moving objects.",
+    )
+    parser.add_argument("--dynamic_right_mask_dilate", default=3, type=int, help="Dilation kernel for dynamic right-view composite mask")
+    parser.add_argument("--dynamic_right_mask_blur", default=1.0, type=float, help="Soft blur radius for dynamic right-view composite mask")
+    parser.add_argument("--dynamic_right_mask_shift_px", default=0, type=int, help="Optional horizontal pixel shift applied to the composite mask; keep 0 unless you know the needed shift")
+    parser.add_argument("--dynamic_right_mask_threshold", default=0.5, type=float, help="Threshold applied to dynamic mask before compositing; use high values for diff heatmaps")
+    parser.add_argument("--dynamic_right_mask_max_area", default=0.12, type=float, help="Skip compositing if processed mask covers more than this fraction of the frame")
 
     args = get_combined_args(parser)
     if args.configs:
@@ -579,6 +681,13 @@ if __name__ == "__main__":
     print(f"  IPD: {args.ipd * 100:.1f} cm")
     print(f"  Convergence distance: {args.convergence_distance} m")
     print(f"  Output format: {args.output_format}")
+    if args.dynamic_right_composite:
+        print(
+            "  Dynamic right composite: enabled "
+            f"(dilate={args.dynamic_right_mask_dilate}, blur={args.dynamic_right_mask_blur}, "
+            f"shift_px={args.dynamic_right_mask_shift_px}, threshold={args.dynamic_right_mask_threshold}, "
+            f"max_area={args.dynamic_right_mask_max_area})"
+        )
 
     safe_state(args.quiet)
     render_stereo_sets(
@@ -595,4 +704,10 @@ if __name__ == "__main__":
         args.output_format,
         gt_source_path=args.gt_source_path,
         fps=args.fps,
+        dynamic_right_composite=args.dynamic_right_composite,
+        dynamic_right_mask_dilate=args.dynamic_right_mask_dilate,
+        dynamic_right_mask_blur=args.dynamic_right_mask_blur,
+        dynamic_right_mask_shift_px=args.dynamic_right_mask_shift_px,
+        dynamic_right_mask_threshold=args.dynamic_right_mask_threshold,
+        dynamic_right_mask_max_area=args.dynamic_right_mask_max_area,
     )

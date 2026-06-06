@@ -24,7 +24,8 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", near=0.01, far=100.0, timestamp=0.0, rayo=None, rayd=None, rays=None, cxr=0.0,cyr=0.0,
-                 cam_no=None, frame_no=None, image_path=None, img_wh=None, dynamic_mask=None, dynamic_mask_path=None):
+                 cam_no=None, frame_no=None, image_path=None, img_wh=None, dynamic_mask=None, dynamic_mask_path=None,
+                 motion_prior=None, motion_prior_path=None, depth_map=None, depth_path=None):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -44,6 +45,10 @@ class Camera(nn.Module):
         self.image_path = image_path
         self.dynamic_mask = dynamic_mask
         self.dynamic_mask_path = dynamic_mask_path
+        self.motion_prior = motion_prior
+        self.motion_prior_path = motion_prior_path
+        self.depth_map = depth_map
+        self.depth_path = depth_path
         
         try:
             self.data_device = torch.device(data_device)
@@ -77,6 +82,10 @@ class Camera(nn.Module):
         
         if self.dynamic_mask is None and self.dynamic_mask_path is not None and self.image_width is not None and self.image_height is not None:
             self.load_dynamic_mask()
+        if self.motion_prior is None and self.motion_prior_path is not None and self.image_width is not None and self.image_height is not None:
+            self.load_motion_prior()
+        if self.depth_map is None and self.depth_path is not None and self.image_width is not None and self.image_height is not None:
+            self.load_depth_map()
 
 
         self.zfar = 100.0
@@ -142,6 +151,74 @@ class Camera(nn.Module):
             dynamic_mask = dynamic_mask.resize(mask_size, Image.NEAREST)
         self.dynamic_mask = self.transform(dynamic_mask)[:1].clamp(0.0, 1.0)
 
+    def load_motion_prior(self):
+        if self.motion_prior_path is None:
+            self.motion_prior = None
+            return
+        if self.img_wh is not None:
+            prior_size = self.img_wh
+        elif self.image_width is not None and self.image_height is not None:
+            prior_size = (self.image_width, self.image_height)
+        else:
+            prior_size = None
+        if self.motion_prior_path.endswith(".npz") or self.motion_prior_path.endswith(".npy"):
+            data = np.load(self.motion_prior_path)
+            if isinstance(data, np.lib.npyio.NpzFile):
+                if "confidence" in data:
+                    prior = data["confidence"].astype(np.float32)
+                elif "motion" in data:
+                    prior = data["motion"].astype(np.float32)
+                elif "residual_mag" in data:
+                    prior = data["residual_mag"].astype(np.float32)
+                    finite = np.isfinite(prior)
+                    if finite.any():
+                        scale = np.percentile(prior[finite], 99.0)
+                        prior = prior / max(float(scale), 1e-6)
+                else:
+                    first_key = list(data.keys())[0]
+                    prior = data[first_key].astype(np.float32)
+            else:
+                prior = data.astype(np.float32)
+            prior = np.nan_to_num(prior, nan=0.0, posinf=0.0, neginf=0.0)
+            prior = torch.from_numpy(prior)
+            if prior.dim() == 3:
+                prior = prior[..., 0] if prior.shape[-1] <= 4 else prior[0]
+            prior = prior.unsqueeze(0).unsqueeze(0).float()
+            if prior_size is not None:
+                prior = torch.nn.functional.interpolate(prior, size=(prior_size[1], prior_size[0]), mode="bilinear", align_corners=False)
+            self.motion_prior = prior.squeeze(0).clamp(0.0, 1.0)
+        else:
+            prior_img = Image.open(self.motion_prior_path).convert("L")
+            if prior_size is not None:
+                prior_img = prior_img.resize(prior_size, Image.BILINEAR)
+            self.motion_prior = self.transform(prior_img)[:1].clamp(0.0, 1.0)
+
+    def load_depth_map(self):
+        if self.depth_path is None:
+            self.depth_map = None
+            return
+        import os
+        if self.img_wh is not None:
+            depth_size = self.img_wh
+        elif self.image_width is not None and self.image_height is not None:
+            depth_size = (self.image_width, self.image_height)
+        else:
+            depth_size = None
+        if self.depth_path.endswith(".npy"):
+            depth = np.load(self.depth_path).astype(np.float32)
+            depth = torch.from_numpy(depth)
+            if depth.dim() == 3:
+                depth = depth.squeeze()
+            depth = depth.unsqueeze(0).unsqueeze(0)
+            if depth_size is not None:
+                depth = torch.nn.functional.interpolate(depth, size=(depth_size[1], depth_size[0]), mode="bilinear", align_corners=False)
+            self.depth_map = depth.squeeze(0).clamp_min(0.0)
+        else:
+            depth_img = Image.open(self.depth_path).convert("F")
+            if depth_size is not None:
+                depth_img = depth_img.resize(depth_size, Image.BILINEAR)
+            self.depth_map = self.transform(depth_img)[:1].float().clamp_min(0.0)
+
     def load_image(self):
         original_image = Image.open(self.image_path).convert("RGB")
         original_image = original_image.resize(self.img_wh, Image.LANCZOS)
@@ -152,6 +229,10 @@ class Camera(nn.Module):
             self.original_image *= self.gt_alpha_mask.to(self.data_device)
         if self.dynamic_mask is None and self.dynamic_mask_path is not None:
             self.load_dynamic_mask()
+        if self.motion_prior is None and self.motion_prior_path is not None:
+            self.load_motion_prior()
+        if self.depth_map is None and self.depth_path is not None:
+            self.load_depth_map()
     
     def set_image(self):
         self.image_width = self.img_wh[0]

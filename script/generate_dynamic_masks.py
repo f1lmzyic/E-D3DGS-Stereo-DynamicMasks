@@ -24,6 +24,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter
+try:
+    from scipy import ndimage as ndi
+except Exception:
+    ndi = None
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 
@@ -122,35 +126,44 @@ def threshold_image(arr: np.ndarray, threshold: float, auto_percentile: float = 
     return (arr >= thr).astype(np.uint8) * 255
 
 
-def fill_components(mask: Image.Image, mode: str, min_area: int, padding: int, max_components: int) -> Image.Image:
-    if mode == "none":
-        return mask
-
+def fill_components(mask: Image.Image, mode: str, min_area: int, max_area: int, padding: int, max_components: int) -> Image.Image:
     arr = np.asarray(mask, dtype=np.uint8) > 0
     h, w = arr.shape
-    visited = np.zeros_like(arr, dtype=bool)
     components = []
 
-    for y0, x0 in zip(*np.nonzero(arr & ~visited)):
-        if visited[y0, x0]:
-            continue
-        stack = [(int(y0), int(x0))]
-        visited[y0, x0] = True
-        xs, ys = [], []
-        while stack:
-            y, x = stack.pop()
-            ys.append(y)
-            xs.append(x)
-            for ny in (y - 1, y, y + 1):
-                for nx in (x - 1, x, x + 1):
-                    if ny == y and nx == x:
-                        continue
-                    if 0 <= ny < h and 0 <= nx < w and arr[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-        area = len(xs)
-        if area >= min_area:
-            components.append((area, min(xs), min(ys), max(xs), max(ys)))
+    if ndi is not None:
+        labels, nlab = ndi.label(arr, structure=np.ones((3, 3), dtype=np.uint8))
+        objs = ndi.find_objects(labels)
+        areas = np.bincount(labels.ravel()) if nlab > 0 else np.array([0])
+        for lab, slc in enumerate(objs, start=1):
+            if slc is None:
+                continue
+            area = int(areas[lab])
+            if area >= min_area and (max_area <= 0 or area <= max_area):
+                sy, sx = slc
+                components.append((area, sx.start, sy.start, sx.stop - 1, sy.stop - 1, lab, labels))
+    else:
+        visited = np.zeros_like(arr, dtype=bool)
+        for y0, x0 in zip(*np.nonzero(arr & ~visited)):
+            if visited[y0, x0]:
+                continue
+            stack = [(int(y0), int(x0))]
+            visited[y0, x0] = True
+            xs, ys = [], []
+            while stack:
+                y, x = stack.pop()
+                ys.append(y)
+                xs.append(x)
+                for ny in (y - 1, y, y + 1):
+                    for nx in (x - 1, x, x + 1):
+                        if ny == y and nx == x:
+                            continue
+                        if 0 <= ny < h and 0 <= nx < w and arr[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            area = len(xs)
+            if area >= min_area and (max_area <= 0 or area <= max_area):
+                components.append((area, min(xs), min(ys), max(xs), max(ys), None, None))
 
     components.sort(reverse=True, key=lambda c: c[0])
     if max_components > 0:
@@ -158,12 +171,20 @@ def fill_components(mask: Image.Image, mode: str, min_area: int, padding: int, m
 
     out = np.zeros((h, w), dtype=np.uint8)
     yy, xx = np.ogrid[:h, :w]
-    for _, x1, y1, x2, y2 in components:
+    for comp in components:
+        _, x1, y1, x2, y2, lab, labels = comp
+        bx1, by1, bx2, by2 = x1, y1, x2, y2
         x1 = max(0, x1 - padding)
         y1 = max(0, y1 - padding)
         x2 = min(w - 1, x2 + padding)
         y2 = min(h - 1, y2 + padding)
-        if mode == "bbox":
+        if mode == "none":
+            if labels is not None:
+                region = labels == lab
+                out[region] = 255
+            else:
+                out[arr & (xx >= bx1) & (xx <= bx2) & (yy >= by1) & (yy <= by2)] = 255
+        elif mode == "bbox":
             out[y1:y2 + 1, x1:x2 + 1] = 255
         elif mode == "ellipse":
             cx = (x1 + x2) / 2.0
@@ -179,7 +200,7 @@ def fill_components(mask: Image.Image, mode: str, min_area: int, padding: int, m
 
 
 def postprocess(mask: Image.Image, erode: int, dilate: int, close: int, blur: float, min_value: int,
-                component_fill: str, min_component_area: int, component_padding: int, max_components: int) -> Image.Image:
+                component_fill: str, min_component_area: int, max_component_area: int, component_padding: int, max_components: int) -> Image.Image:
     # close = dilate then erode, useful for filling holes in moving objects
     if close > 0:
         k = close if close % 2 == 1 else close + 1
@@ -190,7 +211,7 @@ def postprocess(mask: Image.Image, erode: int, dilate: int, close: int, blur: fl
     if dilate > 0:
         k = dilate if dilate % 2 == 1 else dilate + 1
         mask = mask.filter(ImageFilter.MaxFilter(k))
-    mask = fill_components(mask, component_fill, min_component_area, component_padding, max_components)
+    mask = fill_components(mask, component_fill, min_component_area, max_component_area, component_padding, max_components)
     if blur > 0:
         mask = mask.filter(ImageFilter.GaussianBlur(blur))
         if min_value > 0:
@@ -269,7 +290,7 @@ def make_masks_for_group(
         mask_arr = threshold_image(motion, args.threshold, args.auto_percentile, args.auto_scale)
         mask = Image.fromarray(mask_arr, mode="L")
         mask = postprocess(mask, args.erode, args.dilate, args.close, args.blur, args.blur_min_value,
-                           args.component_fill, args.min_component_area, args.component_padding, args.max_components)
+                           args.component_fill, args.min_component_area, args.max_component_area, args.component_padding, args.max_components)
 
         rel = path.relative_to(images_root)
         out_path = output_root / rel
@@ -291,7 +312,7 @@ def main():
     parser.add_argument("--source", required=True, help="Scene root directory")
     parser.add_argument("--images", default="images", help="Images directory relative to source, or absolute path")
     parser.add_argument("--output", default="dynamic_masks", help="Output mask dir relative to source, or absolute path")
-    parser.add_argument("--method", choices=["median", "temporal", "combined"], default="combined")
+    parser.add_argument("--method", choices=["median", "temporal", "combined"], default="combined", help="Motion-only mask method; colour-specific object detection is intentionally disabled")
     parser.add_argument("--threshold", type=float, default=25.0, help="Minimum difference threshold in [0,255]")
     parser.add_argument("--diff_mode", choices=["gray", "rgb_max", "rgb_l2"], default="rgb_max", help="Difference metric. rgb_max is best when a colored ball has similar grayscale luminance to the background")
     parser.add_argument("--auto_percentile", type=float, default=0.0, help="Optional percentile-based adaptive threshold, e.g. 97")
@@ -306,6 +327,7 @@ def main():
     parser.add_argument("--blur_min_value", type=int, default=1, help="After blur, values below this are reset to zero")
     parser.add_argument("--component_fill", choices=["none", "bbox", "ellipse"], default="none", help="Fill connected motion blobs by bbox/ellipse; useful when only object edges/dots are detected")
     parser.add_argument("--min_component_area", type=int, default=20, help="Ignore connected components smaller than this before component filling")
+    parser.add_argument("--max_component_area", type=int, default=0, help="Ignore connected components larger than this; 0 disables")
     parser.add_argument("--component_padding", type=int, default=8, help="Pixels added around each component bbox before filling")
     parser.add_argument("--max_components", type=int, default=0, help="Keep only N largest components before filling; 0 keeps all")
     parser.add_argument("--overlay_dir", default="dynamic_mask_overlays", help="Optional overlay output dir; empty disables")

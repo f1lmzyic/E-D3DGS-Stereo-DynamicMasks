@@ -6,7 +6,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, cam_no=None, iter=None, train_coarse=False, \
-    num_down_emb_c=5, num_down_emb_f=5):
+    num_down_emb_c=5, num_down_emb_f=5, layer_mode=None):
     """
     Render the scene. 
     
@@ -73,15 +73,37 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D_final, scales_final, rotations_final, opacity_final, shs_final, extras = pc._deformation(means3D, scales,
             rotations, opacity, time, cam_no, pc, None, shs, iter=iter, num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f)
 
-    means3D_final = means3D_final.float()
-    scales_final = scales_final.float()
-    rotations_final = rotations_final.float()
-    opacity_final = opacity_final.float()
-    shs_final = shs_final.float()
+    static_bg_enabled = getattr(pc._deformation.args, "layer_static_background", False)
+    static_bg_min_iter = getattr(pc._deformation.args, "layer_static_background_min_iter", 5000)
+    if static_bg_enabled and (iter is None or iter >= static_bg_min_iter):
+        fg_prob = pc.get_foreground_prob.to(means3D_final.device).float().detach()
+        orig = extras[1]
+        means3D_orig, scales_orig, rotations_orig, opacity_orig, shs_orig = orig
+        # Background Gaussians should not be explained by the dynamic deformation field.
+        # Blend deformed parameters only for foreground-probable Gaussians so static
+        # background stays locked while the moving object can still deform.
+        means3D_final = means3D_orig * (1.0 - fg_prob) + means3D_final * fg_prob
+        scales_final = scales_orig * (1.0 - fg_prob) + scales_final * fg_prob
+        rotations_final = rotations_orig * (1.0 - fg_prob) + rotations_final * fg_prob
+        opacity_final = opacity_orig * (1.0 - fg_prob) + opacity_final * fg_prob
+        shs_final = shs_orig * (1.0 - fg_prob[:, None, :]) + shs_final * fg_prob[:, None, :]
+
+    means3D_final = torch.nan_to_num(means3D_final.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    # Deformation can occasionally drive raw scale/opacity/SH logits to inf around the
+    # c2f-temporal transition. Clamp before activation so one bad iteration cannot
+    # corrupt the whole model into transparent/white renders.
+    scales_final = torch.nan_to_num(scales_final.float(), nan=-10.0, posinf=1.0, neginf=-10.0).clamp(-10.0, 1.0)
+    rotations_final = torch.nan_to_num(rotations_final.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    opacity_final = torch.nan_to_num(opacity_final.float(), nan=-20.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+    shs_final = torch.nan_to_num(shs_final.float(), nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity = pc.opacity_activation(opacity_final)
+    if layer_mode in ("foreground", "fg"):
+        opacity = opacity * pc.get_foreground_prob.to(opacity.device).float()
+    elif layer_mode in ("background", "bg"):
+        opacity = opacity * (1.0 - pc.get_foreground_prob.to(opacity.device).float())
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
@@ -125,5 +147,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth":depth,
+            "means3D_final": means3D_final,
+            "scales_final": scales_final,
+            "opacity_final": opacity,
             "sh_coefs_final": shs_final,
             "extras":extras,}

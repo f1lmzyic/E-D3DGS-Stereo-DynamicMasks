@@ -19,8 +19,83 @@ import torch
 import os 
 WARNED = False
 MISSING_DYNAMIC_MASKS = set()
+MISSING_MOTION_PRIORS = set()
+
+def _resolve_sidecar_path(args, image_path, enabled_attr, dir_attr, default_dir, exts, warn_set, label):
+    if not getattr(args, enabled_attr, False) or image_path is None:
+        return None
+
+    source_path = getattr(args, "source_path", "")
+    images_dir = getattr(args, "images", "images")
+    sidecar_dir = getattr(args, dir_attr, default_dir)
+    images_root = images_dir if os.path.isabs(images_dir) else os.path.join(source_path, images_dir)
+    sidecar_root = sidecar_dir if os.path.isabs(sidecar_dir) else os.path.join(source_path, sidecar_dir)
+
+    try:
+        rel_path = os.path.relpath(image_path, images_root)
+    except ValueError:
+        rel_path = os.path.basename(image_path)
+    if rel_path.startswith(".."):
+        rel_path = os.path.basename(image_path)
+
+    candidate = os.path.join(sidecar_root, rel_path)
+    candidates = [candidate]
+    stem, _ = os.path.splitext(candidate)
+    candidates.extend([stem + ext for ext in exts])
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    if image_path not in warn_set and len(warn_set) < 20:
+        print(f"[WARN] {label} not found for {image_path}; expected under {sidecar_root}")
+        warn_set.add(image_path)
+    return None
+
 
 def resolve_dynamic_mask_path(args, image_path):
+    return _resolve_sidecar_path(args, image_path, "use_dynamic_masks", "dynamic_mask_dir", "dynamic_masks", [".png", ".jpg", ".jpeg"], MISSING_DYNAMIC_MASKS, "Dynamic mask")
+
+
+def resolve_motion_prior_path(args, image_path):
+    if not getattr(args, "use_motion_priors", False) or image_path is None:
+        return None
+
+    source_path = getattr(args, "source_path", "")
+    images_dir = getattr(args, "images", "images")
+    sidecar_dir = getattr(args, "motion_prior_dir", "motion_priors")
+    images_root = images_dir if os.path.isabs(images_dir) else os.path.join(source_path, images_dir)
+    sidecar_root = sidecar_dir if os.path.isabs(sidecar_dir) else os.path.join(source_path, sidecar_dir)
+
+    try:
+        rel_path = os.path.relpath(image_path, images_root)
+    except ValueError:
+        rel_path = os.path.basename(image_path)
+    if rel_path.startswith(".."):
+        rel_path = os.path.basename(image_path)
+
+    candidate = os.path.join(sidecar_root, rel_path)
+    stem, _ = os.path.splitext(candidate)
+    # Prefer rich NPZ/NPY sidecars over the inspection PNG written by the generator.
+    candidates = [stem + ext for ext in [".npz", ".npy", ".png", ".jpg", ".jpeg"]]
+    candidates.append(candidate)
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    if image_path not in MISSING_MOTION_PRIORS and len(MISSING_MOTION_PRIORS) < 20:
+        print(f"[WARN] Motion prior not found for {image_path}; expected under {sidecar_root}")
+        MISSING_MOTION_PRIORS.add(image_path)
+    return None
+
+
+def resolve_depth_path(args, image_path):
+    if not hasattr(resolve_depth_path, "missing"):
+        resolve_depth_path.missing = set()
+    return _resolve_sidecar_path(args, image_path, "use_depth_maps", "depth_dir", "depth_da3", [".npy", ".png", ".tiff", ".tif"], resolve_depth_path.missing, "Depth map")
+
+
+def _old_resolve_dynamic_mask_path_unused(args, image_path):
     if not getattr(args, "use_dynamic_masks", False) or image_path is None:
         return None
 
@@ -91,11 +166,13 @@ def loadCam(args, id, cam_info, resolution_scale):
         rays_o = None
         rays_d = None
     dynamic_mask_path = resolve_dynamic_mask_path(args, cam_info.image_path)
+    motion_prior_path = resolve_motion_prior_path(args, cam_info.image_path)
+    depth_path = resolve_depth_path(args, cam_info.image_path)
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device, near=cam_info.near, far=cam_info.far, timestamp=cam_info.timestamp, rayo=rays_o, rayd=rays_d,
-                  dynamic_mask_path=dynamic_mask_path)
+                  dynamic_mask_path=dynamic_mask_path, motion_prior_path=motion_prior_path, depth_path=depth_path)
 
 
 
@@ -161,12 +238,14 @@ def loadCamv2(args, id, cam_info, resolution_scale):
         rays_d = None
 
     dynamic_mask_path = resolve_dynamic_mask_path(args, cam_info.image_path)
+    motion_prior_path = resolve_motion_prior_path(args, cam_info.image_path)
+    depth_path = resolve_depth_path(args, cam_info.image_path)
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device='cpu', near=cam_info.near, far=cam_info.far, timestamp=cam_info.timestamp, rayo=rays_o, rayd=rays_d,cxr=cam_info.cxr,cyr=cam_info.cyr,
                   cam_no=cam_no, frame_no=frame_no, image_path=cam_info.image_path, img_wh=resolution,
-                  dynamic_mask_path=dynamic_mask_path)
+                  dynamic_mask_path=dynamic_mask_path, motion_prior_path=motion_prior_path, depth_path=depth_path)
 
 
 def loadCamHyper(args, id, cam_info, resolution_scale):
@@ -214,13 +293,16 @@ def loadCamHyper(args, id, cam_info, resolution_scale):
     cam_no = 0 
     frame_no = int(cam_info.image_name.split('.')[-2].split('_')[-1])
 
-    dynamic_mask_path = resolve_dynamic_mask_path(args, getattr(cam_info, "image_path", None))
+    image_path = getattr(cam_info, "image_path", None)
+    dynamic_mask_path = resolve_dynamic_mask_path(args, image_path)
+    motion_prior_path = resolve_motion_prior_path(args, image_path)
+    depth_path = resolve_depth_path(args, image_path)
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device='cpu', near=cam_info.near, far=cam_info.far, timestamp=cam_info.timestamp, rayo=rays_o, rayd=rays_d,cxr=cam_info.cxr,cyr=cam_info.cyr,
-                  cam_no=cam_no, frame_no=frame_no,
-                  dynamic_mask_path=dynamic_mask_path)
+                  cam_no=cam_no, frame_no=frame_no, image_path=image_path, img_wh=resolution,
+                  dynamic_mask_path=dynamic_mask_path, motion_prior_path=motion_prior_path, depth_path=depth_path)
 
 
 
