@@ -27,17 +27,12 @@ from time import time
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, hyperparam=None, save_dynamic_masks=False):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, hyperparam=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    masks_path = os.path.join(model_path, name, "ours_{}".format(iteration), "dynamic_masks")
-    mask_overlays_path = os.path.join(model_path, name, "ours_{}".format(iteration), "dynamic_mask_overlays")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
-    if save_dynamic_masks:
-        makedirs(masks_path, exist_ok=True)
-        makedirs(mask_overlays_path, exist_ok=True)
     render_images = []
     gt_list = []
     render_list = []
@@ -66,11 +61,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if name in ["train", "test"]:
             gt = view.original_image[0:3, :, :]
             torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(count) + ".png"))
-            if save_dynamic_masks and getattr(view, "dynamic_mask", None) is not None:
-                mask = view.dynamic_mask.float().clamp(0.0, 1.0)
-                torchvision.utils.save_image(mask, os.path.join(masks_path, '{0:05d}'.format(count) + ".png"))
-                overlay = gt * (1.0 - 0.45 * mask) + torch.tensor([1.0, 0.0, 0.0], device=gt.device).view(3, 1, 1) * (0.45 * mask)
-                torchvision.utils.save_image(overlay.clamp(0.0, 1.0), os.path.join(mask_overlays_path, '{0:05d}'.format(count) + ".png"))
             # gt_list.append(gt)
         count +=1
         
@@ -100,15 +90,12 @@ def render_sets(dataset : ModelParams, hyperparam, opt, iteration : int, pipelin
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        save_dynamic_masks = getattr(dataset, "use_dynamic_masks", False)
-        if save_dynamic_masks:
-            print(f"Rendering with dynamic masks from '{dataset.dynamic_mask_dir}'")
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, hyperparam=hyperparam, save_dynamic_masks=save_dynamic_masks)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, hyperparam=hyperparam)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, hyperparam=hyperparam, save_dynamic_masks=save_dynamic_masks)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, hyperparam=hyperparam)
         if not skip_video:
-            render_set(dataset.model_path, "video", scene.loaded_iter, scene.getVideoCameras(), gaussians, pipeline, background, hyperparam=hyperparam, save_dynamic_masks=False)
+            render_set(dataset.model_path, "video", scene.loaded_iter, scene.getVideoCameras(), gaussians, pipeline, background, hyperparam=hyperparam)
 
 
 if __name__ == "__main__":

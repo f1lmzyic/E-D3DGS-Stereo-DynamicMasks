@@ -6,7 +6,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, cam_no=None, iter=None, train_coarse=False, \
-    num_down_emb_c=5, num_down_emb_f=5, layer_mode=None):
+    num_down_emb_c=5, num_down_emb_f=5):
     """
     Render the scene. 
     
@@ -73,21 +73,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D_final, scales_final, rotations_final, opacity_final, shs_final, extras = pc._deformation(means3D, scales,
             rotations, opacity, time, cam_no, pc, None, shs, iter=iter, num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f)
 
-    static_bg_enabled = getattr(pc._deformation.args, "layer_static_background", False)
-    static_bg_min_iter = getattr(pc._deformation.args, "layer_static_background_min_iter", 5000)
-    if static_bg_enabled and (iter is None or iter >= static_bg_min_iter):
-        fg_prob = pc.get_foreground_prob.to(means3D_final.device).float().detach()
-        orig = extras[1]
-        means3D_orig, scales_orig, rotations_orig, opacity_orig, shs_orig = orig
-        # Background Gaussians should not be explained by the dynamic deformation field.
-        # Blend deformed parameters only for foreground-probable Gaussians so static
-        # background stays locked while the moving object can still deform.
-        means3D_final = means3D_orig * (1.0 - fg_prob) + means3D_final * fg_prob
-        scales_final = scales_orig * (1.0 - fg_prob) + scales_final * fg_prob
-        rotations_final = rotations_orig * (1.0 - fg_prob) + rotations_final * fg_prob
-        opacity_final = opacity_orig * (1.0 - fg_prob) + opacity_final * fg_prob
-        shs_final = shs_orig * (1.0 - fg_prob[:, None, :]) + shs_final * fg_prob[:, None, :]
-
     means3D_final = torch.nan_to_num(means3D_final.float(), nan=0.0, posinf=1e4, neginf=-1e4)
     # Deformation can occasionally drive raw scale/opacity/SH logits to inf around the
     # c2f-temporal transition. Clamp before activation so one bad iteration cannot
@@ -100,10 +85,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity = pc.opacity_activation(opacity_final)
-    if layer_mode in ("foreground", "fg"):
-        opacity = opacity * pc.get_foreground_prob.to(opacity.device).float()
-    elif layer_mode in ("background", "bg"):
-        opacity = opacity * (1.0 - pc.get_foreground_prob.to(opacity.device).float())
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:

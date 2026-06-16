@@ -120,16 +120,20 @@ def _farneback_flow(prev_uint8, next_uint8):
     ).astype(np.float32)
 
 
-def proxy_epe(render_frames_uint8, gt_frames_uint8):
-    """Proxy EPE: endpoint error between Farneback flow(render) and flow(GT).
+def proxy_tepe(render_frames_uint8, gt_frames_uint8):
+    """Proxy TEPE: Temporal Endpoint Error between render and GT optical flow.
 
-    This is not a replacement for true GT optical-flow EPE. It is useful when no
-    GT flow exists and you want a temporal-motion fidelity signal.
+    For each adjacent frame pair, Farneback flow is estimated for the rendered
+    sequence and the GT sequence. TEPE is the mean per-pixel endpoint error
+    between those two temporal flow fields, averaged over frame pairs.
+
+    This is not a replacement for true GT optical-flow EPE; it is a proxy temporal
+    motion-fidelity metric when only RGB frames are available. Lower is better.
     """
     n = min(len(render_frames_uint8), len(gt_frames_uint8))
     if n < 2:
         return None
-    epes = []
+    tepes = []
     for i in range(n - 1):
         r0, r1 = render_frames_uint8[i], render_frames_uint8[i + 1]
         g0, g1 = gt_frames_uint8[i], gt_frames_uint8[i + 1]
@@ -139,9 +143,104 @@ def proxy_epe(render_frames_uint8, gt_frames_uint8):
             g1 = cv2.resize(g1, (r1.shape[1], r1.shape[0]), interpolation=cv2.INTER_LINEAR)
         flow_r = _farneback_flow(r0, r1)
         flow_g = _farneback_flow(g0, g1)
-        epe = np.sqrt(((flow_r - flow_g) ** 2).sum(axis=2))
-        epes.append(float(epe.mean()))
-    return float(np.mean(epes))
+        flow_err = flow_r - flow_g
+        # Official OpenCV L2 magnitude for endpoint error per pixel.
+        tepe = cv2.magnitude(flow_err[..., 0], flow_err[..., 1])
+        tepes.append(float(tepe.mean()))
+    return float(np.mean(tepes))
+
+
+def proxy_epe(render_frames_uint8, gt_frames_uint8):
+    """Backward-compatible alias for proxy_tepe()."""
+    return proxy_tepe(render_frames_uint8, gt_frames_uint8)
+
+
+def _frame_index_from_name(name):
+    digits = "".join(ch for ch in Path(name).stem if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _find_flow_file(gt_flow_dir, image_name):
+    if gt_flow_dir is None:
+        return None
+    gt_flow_dir = Path(gt_flow_dir)
+    if not gt_flow_dir.is_dir():
+        return None
+    stem = Path(image_name).stem
+    idx = _frame_index_from_name(image_name)
+    candidates = [gt_flow_dir / f"{stem}.npz"]
+    if idx is not None:
+        candidates.extend([
+            gt_flow_dir / f"{idx:05d}.npz",
+            gt_flow_dir / f"{idx:06d}.npz",
+            gt_flow_dir / f"left{idx:06d}.npz",
+            gt_flow_dir / f"right{idx:06d}.npz",
+            gt_flow_dir / f"left{idx:05d}.npz",
+            gt_flow_dir / f"right{idx:05d}.npz",
+        ])
+    for p in candidates:
+        if p.is_file() and "checkpoint" not in p.name:
+            return p
+    if idx is not None:
+        matches = sorted([p for p in gt_flow_dir.glob(f"*{idx:06d}.npz") if "checkpoint" not in p.name])
+        if not matches:
+            matches = sorted([p for p in gt_flow_dir.glob(f"*{idx:05d}.npz") if "checkpoint" not in p.name])
+        if matches:
+            return matches[0]
+    return None
+
+
+def _load_gt_flow(flow_path, key="flow"):
+    data = np.load(flow_path)
+    if key in data:
+        flow = data[key]
+    elif "flow" in data:
+        flow = data["flow"]
+    else:
+        flow_keys = [k for k in data.files if data[k].ndim == 3 and data[k].shape[-1] == 2]
+        if not flow_keys:
+            raise ValueError(f"No HxWx2 flow array found in {flow_path}; keys={data.files}")
+        flow = data[flow_keys[0]]
+    return flow.astype(np.float32)
+
+
+def _resize_flow(flow, width, height):
+    old_h, old_w = flow.shape[:2]
+    if old_h == height and old_w == width:
+        return flow
+    resized = cv2.resize(flow, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    resized[..., 0] *= float(width) / float(old_w)
+    resized[..., 1] *= float(height) / float(old_h)
+    return resized
+
+
+def tepe_against_gt_flow(render_frames_uint8, image_names, gt_flow_dir, gt_flow_key="flow"):
+    """TEPE against supplied GT optical flow files.
+
+    Predicted flow is OpenCV Farneback flow(render_t, render_t+1). GT flow is
+    loaded from per-frame .npz files, normally key='flow'. Endpoint error is
+    computed with cv2.magnitude. Lower is better.
+    """
+    if gt_flow_dir is None or len(render_frames_uint8) < 2:
+        return None, 0
+    vals = []
+    used = 0
+    for i in range(len(render_frames_uint8) - 1):
+        flow_path = _find_flow_file(gt_flow_dir, image_names[i])
+        if flow_path is None:
+            continue
+        r0, r1 = render_frames_uint8[i], render_frames_uint8[i + 1]
+        pred_flow = _farneback_flow(r0, r1)
+        gt_flow = _load_gt_flow(flow_path, key=gt_flow_key)
+        gt_flow = _resize_flow(gt_flow, pred_flow.shape[1], pred_flow.shape[0])
+        valid = np.isfinite(gt_flow[..., 0]) & np.isfinite(gt_flow[..., 1])
+        if valid.sum() == 0:
+            continue
+        flow_err = pred_flow - gt_flow
+        epe = cv2.magnitude(flow_err[..., 0], flow_err[..., 1])
+        vals.append(float(epe[valid].mean()))
+        used += 1
+    return (float(np.mean(vals)) if vals else None), used
 
 
 def _sgbm_disparity(left_uint8, right_uint8, max_disp=128):
@@ -216,7 +315,7 @@ def _score_from_raw(metrics):
     """Normalize available metrics to [0,1] and average them into TotalScore.
 
     Higher raw is better: PSNR, SSIM, IQ-Score, TF-Score.
-    Lower raw is better: LPIPS, EPE, D1-all.
+    Lower raw is better: LPIPS, TEPE/EPE, D1-all.
     """
     scores = {}
     if metrics.get("PSNR") is not None:
@@ -231,8 +330,9 @@ def _score_from_raw(metrics):
         scores["IQ_score_norm"] = float(np.clip(metrics["IQ-Score"], 0.0, 1.0))
     if metrics.get("TF-Score") is not None:
         scores["TF_score_norm"] = float(np.clip(metrics["TF-Score"], 0.0, 1.0))
-    if metrics.get("EPE") is not None:
-        scores["EPE_score"] = float(np.exp(-metrics["EPE"] / 10.0))
+    tepe_value = metrics.get("TEPE") if metrics.get("TEPE") is not None else metrics.get("EPE")
+    if tepe_value is not None:
+        scores["TEPE_score"] = float(np.exp(-tepe_value / 10.0))
     if metrics.get("D1-all") is not None:
         scores["D1_all_score"] = float(np.clip(1.0 - metrics["D1-all"] / 100.0, 0.0, 1.0))
     scores["TotalScore"] = float(np.mean(list(scores.values()))) if scores else None
@@ -251,7 +351,7 @@ def _find_stereo_method_dir(scene_dir, split_name, method):
     return stereo_dirs[-1] if stereo_dirs else None
 
 
-def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compute_tf=True, compute_proxy_epe=True, label="", device=None):
+def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compute_tf=True, compute_proxy_tepe=True, gt_flow_dir=None, gt_flow_key="flow", label="", device=None):
     if device is None:
         device = _default_device()
     renders, gts, image_names = readImages(Path(renders_dir), Path(gt_dir), device=device)
@@ -299,9 +399,14 @@ def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compu
             metrics["GT_TF-Score"] = tf_gt[0]
             metrics["GT_TF-MAE"] = tf_gt[1]
 
-    if compute_proxy_epe:
-        metrics["EPE"] = proxy_epe(render_frames, gt_frames)
-        metrics["EPE_note"] = "Proxy EPE: Farneback flow(render frames) vs Farneback flow(GT frames), not true GT optical-flow EPE."
+    if gt_flow_dir is not None:
+        tepe, tepe_pairs = tepe_against_gt_flow(render_frames, image_names, gt_flow_dir, gt_flow_key=gt_flow_key)
+        metrics["TEPE"] = tepe
+        metrics["TEPE_pairs"] = tepe_pairs
+        metrics["TEPE_note"] = f"TEPE against GT flow from {gt_flow_dir}: cv2.calcOpticalFlowFarneback(render_t, render_t+1) vs npz['{gt_flow_key}'], then cv2.magnitude endpoint error. Lower is better."
+    elif compute_proxy_tepe:
+        metrics["TEPE"] = proxy_tepe(render_frames, gt_frames)
+        metrics["TEPE_note"] = "Proxy TEPE: cv2.calcOpticalFlowFarneback on adjacent render frames vs adjacent GT frames, then cv2.magnitude endpoint error. Lower is better."
 
     per_view = {
         "SSIM": {name: val for val, name in zip(torch.tensor(ssims).tolist(), image_names)},
@@ -314,7 +419,7 @@ def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compu
 
 def _average_left_right(left_metrics, right_metrics):
     avg = {}
-    for key in ["SSIM", "PSNR", "LPIPS_VGG", "LPIPS_ALEX", "IQ-Score", "TF-Score", "TF-MAE", "GT_TF-Score", "GT_TF-MAE", "EPE"]:
+    for key in ["SSIM", "PSNR", "LPIPS_VGG", "LPIPS_ALEX", "IQ-Score", "TF-Score", "TF-MAE", "GT_TF-Score", "GT_TF-MAE", "TEPE", "TEPE_pairs", "EPE"]:
         vals = []
         for m in [left_metrics, right_metrics]:
             if m is not None and m.get(key) is not None:
@@ -323,6 +428,8 @@ def _average_left_right(left_metrics, right_metrics):
             avg[key] = float(np.mean(vals))
     if left_metrics and left_metrics.get("IQ-Score_note"):
         avg["IQ-Score_note"] = left_metrics["IQ-Score_note"]
+    if left_metrics and left_metrics.get("TEPE_note"):
+        avg["TEPE_note"] = left_metrics["TEPE_note"]
     if left_metrics and left_metrics.get("EPE_note"):
         avg["EPE_note"] = left_metrics["EPE_note"]
     return avg
@@ -330,7 +437,7 @@ def _average_left_right(left_metrics, right_metrics):
 
 def _print_metric_summary(scene_dir, key, metrics):
     print("Scene:", scene_dir, "Split/Method:", key)
-    for k in ["PSNR", "SSIM", "LPIPS_ALEX", "LPIPS_VGG", "IQ-Score", "TF-Score", "EPE", "D1-all", "TotalScore"]:
+    for k in ["PSNR", "SSIM", "LPIPS_ALEX", "LPIPS_VGG", "IQ-Score", "TF-Score", "TEPE", "EPE", "D1-all", "TotalScore"]:
         if k in metrics and metrics[k] is not None:
             print(f"  {k}: {metrics[k]:.7f}")
         elif k in metrics:
@@ -348,7 +455,7 @@ def _is_stereo_method_dir(method_dir):
     )
 
 
-def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, compute_proxy_epe=True, compute_proxy_d1=True, device=None):
+def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, compute_proxy_tepe=True, compute_proxy_d1=True, gt_flow_dir=None, left_gt_flow_dir=None, right_gt_flow_dir=None, gt_flow_key="flow", device=None):
     if device is None:
         device = _default_device()
     print(f"Metric device: {device}")
@@ -382,7 +489,9 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                         method_dir / "gt",
                         compute_iq=compute_iq,
                         compute_tf=compute_tf,
-                        compute_proxy_epe=compute_proxy_epe,
+                        compute_proxy_tepe=compute_proxy_tepe,
+                        gt_flow_dir=left_gt_flow_dir or gt_flow_dir,
+                        gt_flow_key=gt_flow_key,
                         label=f"{split_name}/{method}/left",
                         device=device,
                     )
@@ -391,7 +500,9 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                         method_dir / "gt_right",
                         compute_iq=compute_iq,
                         compute_tf=compute_tf,
-                        compute_proxy_epe=compute_proxy_epe,
+                        compute_proxy_tepe=compute_proxy_tepe,
+                        gt_flow_dir=right_gt_flow_dir,
+                        gt_flow_key=gt_flow_key,
                         label=f"{split_name}/{method}/right",
                         device=device,
                     )
@@ -443,7 +554,9 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                     gt_dir,
                     compute_iq=compute_iq,
                     compute_tf=compute_tf,
-                    compute_proxy_epe=compute_proxy_epe,
+                    compute_proxy_tepe=compute_proxy_tepe,
+                    gt_flow_dir=gt_flow_dir or left_gt_flow_dir,
+                    gt_flow_key=gt_flow_key,
                     label=f"{split_name}/{method}",
                     device=device,
                 )
@@ -476,8 +589,13 @@ if __name__ == "__main__":
     parser.add_argument("--test_paths", type=str, default=[])
     parser.add_argument("--compute_iq", action="store_true", help="Compute VBench-style MUSIQ IQ-Score via pyiqa")
     parser.add_argument("--no_tf", action="store_true", help="Disable VBench-style temporal flickering score")
-    parser.add_argument("--no_proxy_epe", action="store_true", help="Disable proxy optical-flow EPE")
+    parser.add_argument("--no_proxy_tepe", action="store_true", help="Disable proxy TEPE temporal optical-flow endpoint error")
+    parser.add_argument("--no_proxy_epe", action="store_true", help="Deprecated alias for --no_proxy_tepe")
     parser.add_argument("--no_proxy_d1", action="store_true", help="Disable proxy D1-all stereo metric")
+    parser.add_argument("--gt_flow_dir", default=None, help="Directory containing GT optical flow .npz files for mono metrics, or stereo-left if --left_gt_flow_dir is unset")
+    parser.add_argument("--left_gt_flow_dir", default=None, help="Directory containing GT optical flow .npz files for stereo left renders")
+    parser.add_argument("--right_gt_flow_dir", default=None, help="Directory containing GT optical flow .npz files for stereo right renders")
+    parser.add_argument("--gt_flow_key", default="flow", help="Key inside GT flow .npz files, default: flow")
     parser.add_argument("--device", default=None, help="Metric device, e.g. cuda:0 or cpu. Defaults to cuda if visible, else cpu.")
 
     args = parser.parse_args()
@@ -486,7 +604,11 @@ if __name__ == "__main__":
         args.test_paths,
         compute_iq=args.compute_iq,
         compute_tf=not args.no_tf,
-        compute_proxy_epe=not args.no_proxy_epe,
+        compute_proxy_tepe=not (args.no_proxy_tepe or args.no_proxy_epe),
         compute_proxy_d1=not args.no_proxy_d1,
+        gt_flow_dir=args.gt_flow_dir,
+        left_gt_flow_dir=args.left_gt_flow_dir,
+        right_gt_flow_dir=args.right_gt_flow_dir,
+        gt_flow_key=args.gt_flow_key,
         device=torch.device(args.device) if args.device is not None else None,
     )

@@ -57,12 +57,8 @@ class ModelParams(ParamGroup):
         self.render_process=False
         self.loader = "colmap"
         self.shuffle = True
-        self.use_dynamic_masks = False
-        self.dynamic_mask_dir = "dynamic_masks"
         self.use_motion_priors = False
         self.motion_prior_dir = "motion_priors"
-        self.use_depth_maps = False
-        self.depth_dir = "depth_da3"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -94,9 +90,6 @@ class ModelHiddenParams(ParamGroup):
         self.no_c2f_temporal_embedding=False
         self.no_coarse_deform=False
         self.no_fine_deform=False
-        self.layer_static_background = False
-        self.layer_static_background_min_iter = 5000
-        
         self.total_num_frames=300
         self.c2f_temporal_iter=20000
         self.deform_from_iter=0
@@ -157,16 +150,6 @@ class OptimizationParams(ParamGroup):
         self.num_multiview_ssim = 0
         self.offsets_lr = 0.00002
         self.reg_coef = 0.1
-        self.dynamic_loss_weight = 0.0
-        self.dynamic_loss_balance = False
-        self.dynamic_loss_max_weight = 20.0
-        self.dynamic_component_loss_weight = 0.0
-        self.dynamic_component_threshold = 0.35
-        self.dynamic_component_min_area = 4
-        self.dynamic_component_max_area = 6000
-        self.dynamic_component_max_components = 16
-        self.dynamic_frame_sample_prob = 0.0
-        self.dynamic_frame_sample_min_area = 0.0001
         self.motion_prior_loss_weight = 0.0
         self.motion_prior_threshold = 0.35
         self.motion_prior_min_area = 0.00005
@@ -175,42 +158,9 @@ class OptimizationParams(ParamGroup):
         self.motion_prior_frame_sample_min_area = 0.00005
         self.use_motion_prior_densification = False
         self.motion_prior_densify_grad_boost = 2.0
-        self.use_mask_guided_densification = False
-        self.mask_densify_grad_boost = 4.0
-        self.mask_densify_threshold = 0.25
-        self.protect_dynamic_pruning = False
-        self.dynamic_prune_protect_threshold = 0.25
-        self.use_mask_seed_points = False
-        self.use_stereo_mask_seed_points = False
-        self.mask_seed_interval = 500
-        self.mask_seed_until_iter = 8000
-        self.mask_seed_points_per_frame = 32
-        self.mask_seed_points_per_component = 8
-        self.mask_seed_threshold = 0.35
-        self.mask_seed_min_component_area = 4
-        self.mask_seed_max_component_area = 4000
-        self.mask_seed_y_tolerance = 12.0
-        self.mask_seed_scale = 0.01
-        self.mask_seed_opacity = 0.2
-        self.mask_seed_depth_scale = 0.95
-        self.mask_seed_default_depth = 2.0
-        self.lambda_depth_mask = 0.0
-        self.depth_loss_min_mask_area = 0.0005
-        self.depth_loss_mask_dilate = 3
         self.lambda_stereo_consistency = 0.0
         self.stereo_baseline = 0.03
         self.stereo_occlusion_tolerance = 0.01
-        self.use_layered_fg_bg = False
-        self.lambda_layered_rgb = 0.0
-        self.lambda_layered_mask = 0.05
-        self.lambda_layered_depth_class = 0.02
-        self.lambda_fg_scale = 0.001
-        self.fg_scale_max = 0.02
-        self.layered_depth_close_thresh = 0.15
-        self.layered_min_iter = 1000
-        self.layered_rgb_interval = 10
-        self.layered_class_interval = 1
-        self.layered_use_depth_gate = False
         
         super().__init__(parser, "Optimization Parameters")
 
