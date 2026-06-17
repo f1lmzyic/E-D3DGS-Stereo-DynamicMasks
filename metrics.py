@@ -12,6 +12,7 @@
 from pathlib import Path
 import os
 import json
+import re
 from argparse import ArgumentParser
 
 import cv2
@@ -120,6 +121,29 @@ def _farneback_flow(prev_uint8, next_uint8):
     ).astype(np.float32)
 
 
+def endpoint_error(flow_a, flow_b, valid=None):
+    """Mean optical-flow endpoint error using PyTorch's vector norm.
+
+    flow_a and flow_b are HxWx2 arrays/tensors. If valid is provided, it should
+    be an HxW boolean mask selecting pixels to include. Lower is better.
+    """
+    if not torch.is_tensor(flow_a):
+        flow_a = torch.from_numpy(np.asarray(flow_a))
+    if not torch.is_tensor(flow_b):
+        flow_b = torch.from_numpy(np.asarray(flow_b))
+    flow_a = flow_a.to(dtype=torch.float32)
+    flow_b = flow_b.to(dtype=torch.float32, device=flow_a.device)
+    epe = torch.linalg.vector_norm(flow_a - flow_b, dim=-1)
+    if valid is not None:
+        if not torch.is_tensor(valid):
+            valid = torch.from_numpy(np.asarray(valid))
+        valid = valid.to(device=epe.device, dtype=torch.bool)
+        epe = epe[valid]
+    if epe.numel() == 0:
+        return None
+    return float(epe.mean().item())
+
+
 def proxy_tepe(render_frames_uint8, gt_frames_uint8):
     """Proxy TEPE: Temporal Endpoint Error between render and GT optical flow.
 
@@ -143,16 +167,20 @@ def proxy_tepe(render_frames_uint8, gt_frames_uint8):
             g1 = cv2.resize(g1, (r1.shape[1], r1.shape[0]), interpolation=cv2.INTER_LINEAR)
         flow_r = _farneback_flow(r0, r1)
         flow_g = _farneback_flow(g0, g1)
-        flow_err = flow_r - flow_g
-        # Official OpenCV L2 magnitude for endpoint error per pixel.
-        tepe = cv2.magnitude(flow_err[..., 0], flow_err[..., 1])
-        tepes.append(float(tepe.mean()))
-    return float(np.mean(tepes))
+        tepe = endpoint_error(flow_r, flow_g)
+        if tepe is not None:
+            tepes.append(tepe)
+    return float(np.mean(tepes)) if tepes else None
 
 
 def proxy_epe(render_frames_uint8, gt_frames_uint8):
-    """Backward-compatible alias for proxy_tepe()."""
-    return proxy_tepe(render_frames_uint8, gt_frames_uint8)
+    """No-reference proxy EPE is intentionally not reported.
+
+    EPE normally requires predicted optical flow and ground-truth optical flow.
+    With only rendered/GT RGB videos available, this script reports proxy TEPE
+    instead (Farneback flow on adjacent render frames vs adjacent GT frames).
+    """
+    return None
 
 
 def _frame_index_from_name(name):
@@ -219,7 +247,7 @@ def tepe_against_gt_flow(render_frames_uint8, image_names, gt_flow_dir, gt_flow_
 
     Predicted flow is OpenCV Farneback flow(render_t, render_t+1). GT flow is
     loaded from per-frame .npz files, normally key='flow'. Endpoint error is
-    computed with cv2.magnitude. Lower is better.
+    computed with torch.linalg.vector_norm. Lower is better.
     """
     if gt_flow_dir is None or len(render_frames_uint8) < 2:
         return None, 0
@@ -236,11 +264,22 @@ def tepe_against_gt_flow(render_frames_uint8, image_names, gt_flow_dir, gt_flow_
         valid = np.isfinite(gt_flow[..., 0]) & np.isfinite(gt_flow[..., 1])
         if valid.sum() == 0:
             continue
-        flow_err = pred_flow - gt_flow
-        epe = cv2.magnitude(flow_err[..., 0], flow_err[..., 1])
-        vals.append(float(epe[valid].mean()))
+        epe = endpoint_error(pred_flow, gt_flow, valid=valid)
+        if epe is None:
+            continue
+        vals.append(epe)
         used += 1
     return (float(np.mean(vals)) if vals else None), used
+
+
+def epe_against_gt_flow(render_frames_uint8, image_names, gt_flow_dir, gt_flow_key="flow"):
+    """Optical-flow EPE against supplied GT flow files.
+
+    Predicted flow is estimated from adjacent rendered RGB frames with Farneback;
+    GT flow is loaded from per-frame .npz files. The per-pixel endpoint error is
+    computed with torch.linalg.vector_norm and averaged. Lower is better.
+    """
+    return tepe_against_gt_flow(render_frames_uint8, image_names, gt_flow_dir, gt_flow_key=gt_flow_key)
 
 
 def _sgbm_disparity(left_uint8, right_uint8, max_disp=128):
@@ -401,12 +440,23 @@ def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compu
 
     if gt_flow_dir is not None:
         tepe, tepe_pairs = tepe_against_gt_flow(render_frames, image_names, gt_flow_dir, gt_flow_key=gt_flow_key)
+        epe, epe_pairs = tepe, tepe_pairs
         metrics["TEPE"] = tepe
         metrics["TEPE_pairs"] = tepe_pairs
-        metrics["TEPE_note"] = f"TEPE against GT flow from {gt_flow_dir}: cv2.calcOpticalFlowFarneback(render_t, render_t+1) vs npz['{gt_flow_key}'], then cv2.magnitude endpoint error. Lower is better."
+        metrics["TEPE_note"] = f"Proper TEPE against GT temporal flow from {gt_flow_dir}: cv2.calcOpticalFlowFarneback(render_t, render_t+1) vs npz['{gt_flow_key}'] for each adjacent frame, resized/scaled to render resolution, then torch.linalg.vector_norm endpoint error averaged over pixels and time. Lower is better."
+        metrics["EPE"] = epe
+        metrics["EPE_pairs"] = epe_pairs
+        metrics["EPE_note"] = f"EPE against GT flow from {gt_flow_dir}: cv2.calcOpticalFlowFarneback(render_t, render_t+1) vs npz['{gt_flow_key}'], then torch.linalg.vector_norm endpoint error. For a sequence aggregate this matches the proper TEPE average. Lower is better."
     elif compute_proxy_tepe:
         metrics["TEPE"] = proxy_tepe(render_frames, gt_frames)
-        metrics["TEPE_note"] = "Proxy TEPE: cv2.calcOpticalFlowFarneback on adjacent render frames vs adjacent GT frames, then cv2.magnitude endpoint error. Lower is better."
+        metrics["TEPE_note"] = "Proxy TEPE only: no GT flow dir found/provided, so cv2.calcOpticalFlowFarneback is run on adjacent render frames and adjacent GT RGB frames, then torch.linalg.vector_norm endpoint error. Lower is better."
+        metrics["EPE"] = None
+        metrics["EPE_note"] = "Unavailable: EPE requires GT optical-flow files via --gt_flow_dir/--left_gt_flow_dir/--right_gt_flow_dir or auto-discovered video0xx/motion_priors."
+    else:
+        metrics["TEPE"] = None
+        metrics["TEPE_note"] = "Unavailable: TEPE requires GT flow files or proxy TEPE enabled."
+        metrics["EPE"] = None
+        metrics["EPE_note"] = "Unavailable: EPE requires GT optical-flow files via --gt_flow_dir/--left_gt_flow_dir/--right_gt_flow_dir or auto-discovered video0xx/motion_priors."
 
     per_view = {
         "SSIM": {name: val for val, name in zip(torch.tensor(ssims).tolist(), image_names)},
@@ -419,7 +469,7 @@ def _compute_image_sequence_metrics(renders_dir, gt_dir, compute_iq=False, compu
 
 def _average_left_right(left_metrics, right_metrics):
     avg = {}
-    for key in ["SSIM", "PSNR", "LPIPS_VGG", "LPIPS_ALEX", "IQ-Score", "TF-Score", "TF-MAE", "GT_TF-Score", "GT_TF-MAE", "TEPE", "TEPE_pairs", "EPE"]:
+    for key in ["SSIM", "PSNR", "LPIPS_VGG", "LPIPS_ALEX", "IQ-Score", "TF-Score", "TF-MAE", "GT_TF-Score", "GT_TF-MAE", "TEPE", "TEPE_pairs", "EPE", "EPE_pairs"]:
         vals = []
         for m in [left_metrics, right_metrics]:
             if m is not None and m.get(key) is not None:
@@ -455,7 +505,54 @@ def _is_stereo_method_dir(method_dir):
     )
 
 
-def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, compute_proxy_tepe=True, compute_proxy_d1=True, gt_flow_dir=None, left_gt_flow_dir=None, right_gt_flow_dir=None, gt_flow_key="flow", device=None):
+def _infer_scene_name(path):
+    match = re.search(r"video\d+", str(path))
+    return match.group(0) if match else None
+
+
+def _candidate_dataset_roots(model_path, dataset_root=None):
+    roots = []
+    if dataset_root:
+        roots.append(Path(dataset_root))
+    # Common layout for this project: <ephemeral-1>/models/... and
+    # <ephemeral-1>/datasets/SK/indoor/<video0xx>/motion_priors/...
+    for parent in Path(model_path).resolve().parents:
+        roots.append(parent / "datasets" / "SK" / "indoor")
+    roots.extend([
+        Path("/rds/general/user/ka1525/home/ephemeral-1/datasets/SK/indoor"),
+        Path("/rds/general/ephemeral/user/ka1525/ephemeral/datasets/SK/indoor"),
+    ])
+    deduped = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            deduped.append(root)
+            seen.add(key)
+    return deduped
+
+
+def _infer_motion_prior_flow_dirs(model_path, dataset_root=None):
+    """Find dataset motion_priors flow folders for a model path containing video0xx."""
+    scene_name = _infer_scene_name(model_path)
+    if scene_name is None:
+        return None, None, None
+    for root in _candidate_dataset_roots(model_path, dataset_root=dataset_root):
+        motion_dir = root / scene_name / "motion_priors"
+        if not motion_dir.is_dir():
+            continue
+        left = motion_dir / "left"
+        right = motion_dir / "right"
+        generic = motion_dir
+        left_dir = left if left.is_dir() and any(left.glob("*.npz")) else None
+        right_dir = right if right.is_dir() and any(right.glob("*.npz")) else None
+        generic_dir = generic if any(generic.glob("*.npz")) else None
+        if left_dir or right_dir or generic_dir:
+            return left_dir, right_dir, generic_dir
+    return None, None, None
+
+
+def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, compute_proxy_tepe=True, compute_proxy_d1=True, gt_flow_dir=None, left_gt_flow_dir=None, right_gt_flow_dir=None, gt_flow_key="flow", device=None, dataset_root=None, auto_motion_priors=True):
     if device is None:
         device = _default_device()
     print(f"Metric device: {device}")
@@ -467,6 +564,21 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
         print("Scene:", scene_dir)
         full_dict[scene_dir] = {}
         per_view_dict[scene_dir] = {}
+
+        auto_left_gt_flow_dir = auto_right_gt_flow_dir = auto_gt_flow_dir = None
+        if auto_motion_priors:
+            auto_left_gt_flow_dir, auto_right_gt_flow_dir, auto_gt_flow_dir = _infer_motion_prior_flow_dirs(scene_dir, dataset_root=dataset_root)
+            if auto_left_gt_flow_dir or auto_right_gt_flow_dir or auto_gt_flow_dir:
+                print(
+                    "Auto motion-prior flow dirs:",
+                    "left=", auto_left_gt_flow_dir,
+                    "right=", auto_right_gt_flow_dir,
+                    "generic=", auto_gt_flow_dir,
+                )
+
+        effective_left_gt_flow_dir = left_gt_flow_dir or gt_flow_dir or auto_left_gt_flow_dir or auto_gt_flow_dir
+        effective_right_gt_flow_dir = right_gt_flow_dir or gt_flow_dir or auto_right_gt_flow_dir or auto_gt_flow_dir
+        effective_mono_gt_flow_dir = gt_flow_dir or left_gt_flow_dir or auto_left_gt_flow_dir or auto_gt_flow_dir
 
         split_candidates = ["test", "train"]
         split_dirs = [Path(scene_dir) / s for s in split_candidates if (Path(scene_dir) / s).is_dir()]
@@ -480,6 +592,9 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                 method_dir = split_dir / method
                 if not method_dir.is_dir():
                     continue
+                if method == "ours_30000":
+                    print(f"Skipping {split_name}/{method}")
+                    continue
 
                 # Stereo render output: compute left, right, and left/right average.
                 if _is_stereo_method_dir(method_dir):
@@ -490,7 +605,7 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                         compute_iq=compute_iq,
                         compute_tf=compute_tf,
                         compute_proxy_tepe=compute_proxy_tepe,
-                        gt_flow_dir=left_gt_flow_dir or gt_flow_dir,
+                        gt_flow_dir=effective_left_gt_flow_dir,
                         gt_flow_key=gt_flow_key,
                         label=f"{split_name}/{method}/left",
                         device=device,
@@ -501,7 +616,7 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                         compute_iq=compute_iq,
                         compute_tf=compute_tf,
                         compute_proxy_tepe=compute_proxy_tepe,
-                        gt_flow_dir=right_gt_flow_dir,
+                        gt_flow_dir=effective_right_gt_flow_dir,
                         gt_flow_key=gt_flow_key,
                         label=f"{split_name}/{method}/right",
                         device=device,
@@ -555,7 +670,7 @@ def evaluate(model_paths, test_paths=None, compute_iq=False, compute_tf=True, co
                     compute_iq=compute_iq,
                     compute_tf=compute_tf,
                     compute_proxy_tepe=compute_proxy_tepe,
-                    gt_flow_dir=gt_flow_dir or left_gt_flow_dir,
+                    gt_flow_dir=effective_mono_gt_flow_dir,
                     gt_flow_key=gt_flow_key,
                     label=f"{split_name}/{method}",
                     device=device,
@@ -596,6 +711,8 @@ if __name__ == "__main__":
     parser.add_argument("--left_gt_flow_dir", default=None, help="Directory containing GT optical flow .npz files for stereo left renders")
     parser.add_argument("--right_gt_flow_dir", default=None, help="Directory containing GT optical flow .npz files for stereo right renders")
     parser.add_argument("--gt_flow_key", default="flow", help="Key inside GT flow .npz files, default: flow")
+    parser.add_argument("--dataset_root", default=None, help="Dataset root containing video0xx folders. Used to auto-find motion_priors flow dirs, e.g. /.../datasets/SK/indoor")
+    parser.add_argument("--no_auto_motion_priors", action="store_true", help="Disable auto-discovery of dataset video0xx/motion_priors flow .npz files")
     parser.add_argument("--device", default=None, help="Metric device, e.g. cuda:0 or cpu. Defaults to cuda if visible, else cpu.")
 
     args = parser.parse_args()
@@ -611,4 +728,6 @@ if __name__ == "__main__":
         right_gt_flow_dir=args.right_gt_flow_dir,
         gt_flow_key=args.gt_flow_key,
         device=torch.device(args.device) if args.device is not None else None,
+        dataset_root=args.dataset_root,
+        auto_motion_priors=not args.no_auto_motion_priors,
     )

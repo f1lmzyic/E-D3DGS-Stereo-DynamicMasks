@@ -183,6 +183,65 @@ def find_sidecar_frame_candidates(train_cams, path_attr, min_area=0.0001, thresh
     return sorted(frame_scores.keys()), frame_scores
 
 
+def parse_stereo_baseline_curriculum(spec, total_iters, default_baseline):
+    """Parse a stereo-baseline schedule.
+
+    Supported forms:
+      - "0.3,0.6,1.0,1.5,2.0" spreads milestones across training.
+      - "1:0.3,6000:0.6,12000:1.0" uses explicit iteration milestones.
+    """
+    spec = str(spec or "").strip()
+    if not spec:
+        return None
+
+    tokens = [tok.strip() for tok in spec.replace(";", ",").split(",") if tok.strip()]
+    if len(tokens) == 0:
+        return None
+
+    has_explicit_iters = any((":" in tok) or ("@" in tok) for tok in tokens)
+    milestones = []
+    try:
+        if has_explicit_iters:
+            for tok in tokens:
+                sep = ":" if ":" in tok else "@"
+                it_s, val_s = tok.split(sep, 1)
+                milestones.append((int(float(it_s)), float(val_s)))
+        else:
+            values = [float(tok) for tok in tokens]
+            if len(values) == 1:
+                milestones = [(1, values[0])]
+            else:
+                total_iters = max(int(total_iters), 1)
+                for i, val in enumerate(values):
+                    frac = i / max(len(values) - 1, 1)
+                    it = 1 + int(round(frac * (total_iters - 1)))
+                    milestones.append((it, val))
+    except ValueError as exc:
+        raise ValueError(f"Invalid --stereo_baseline_curriculum '{spec}': {exc}") from exc
+
+    milestones = sorted((max(1, int(it)), float(val)) for it, val in milestones)
+    if len(milestones) == 0:
+        return None
+    if milestones[0][0] > 1:
+        milestones.insert(0, (1, float(default_baseline)))
+    return milestones
+
+
+def stereo_baseline_at_iteration(milestones, iteration, mode="linear"):
+    if not milestones:
+        return None
+    iteration = int(iteration)
+    if iteration <= milestones[0][0]:
+        return float(milestones[0][1])
+    for (it0, b0), (it1, b1) in zip(milestones[:-1], milestones[1:]):
+        if iteration <= it1:
+            if str(mode).lower() == "step" or it1 <= it0:
+                return float(b0)
+            t = (iteration - it0) / float(it1 - it0)
+            return float(b0 + t * (b1 - b0))
+    return float(milestones[-1][1])
+
+
 def project_gaussians_into_mask(render_pkg, viewpoint_cam, mask, threshold=0.25):
     """Return a bool mask over Gaussians whose projected centers land in a 2D sidecar mask."""
     means = render_pkg.get("means3D_final", None)
@@ -268,6 +327,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     if dataset.loader not in ['nerfies']:
         train_cams = sorted(train_cams, key=lambda x: (x.cam_no, x.frame_no))
 
+    stereo_baseline_schedule = parse_stereo_baseline_curriculum(
+        getattr(opt, "stereo_baseline_curriculum", ""),
+        final_iter,
+        getattr(opt, "stereo_baseline", 0.03),
+    )
+    if getattr(opt, "lambda_stereo_consistency", 0.0) > 0 and stereo_baseline_schedule:
+        print(
+            "Stereo baseline curriculum "
+            f"({getattr(opt, 'stereo_baseline_curriculum_mode', 'linear')}): "
+            + ", ".join(f"{it}:{baseline:g}" for it, baseline in stereo_baseline_schedule)
+        )
+
     motion_frame_candidates = []
     if (getattr(dataset, "use_motion_priors", False)
             and getattr(opt, "motion_prior_frame_sample_prob", 0.0) > 0
@@ -350,7 +421,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             render_depth = render_pkg.get("depth", None)
 
             if opt.lambda_stereo_consistency > 0 and render_depth is not None:
-                right_cam = make_synthetic_right_camera(viewpoint_cam, opt.stereo_baseline)
+                stereo_baseline = stereo_baseline_at_iteration(
+                    stereo_baseline_schedule,
+                    iteration,
+                    getattr(opt, "stereo_baseline_curriculum_mode", "linear"),
+                )
+                if stereo_baseline is None:
+                    stereo_baseline = opt.stereo_baseline
+                right_cam = make_synthetic_right_camera(viewpoint_cam, stereo_baseline)
                 right_pkg = render(right_cam, gaussians, pipe, background, cam_no=cam_no, iter=iteration, \
                     num_down_emb_c=hyper.min_embeddings, num_down_emb_f=hyper.min_embeddings)
                 stereo_loss = stereo_consistency_loss(
@@ -565,7 +643,14 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     if getattr(dataset, "use_motion_priors", False):
         print(f"Using motion priors from '{dataset.motion_prior_dir}' with loss_weight={opt.motion_prior_loss_weight}, oversample={opt.motion_prior_frame_sample_prob}, densify={opt.use_motion_prior_densification}")
     if opt.lambda_stereo_consistency > 0:
-        print(f"Using synthetic stereo consistency with lambda={opt.lambda_stereo_consistency}, baseline={opt.stereo_baseline}")
+        curriculum = getattr(opt, "stereo_baseline_curriculum", "")
+        if curriculum:
+            print(
+                f"Using synthetic stereo consistency with lambda={opt.lambda_stereo_consistency}, "
+                f"baseline curriculum='{curriculum}', mode={getattr(opt, 'stereo_baseline_curriculum_mode', 'linear')}"
+            )
+        else:
+            print(f"Using synthetic stereo consistency with lambda={opt.lambda_stereo_consistency}, baseline={opt.stereo_baseline}")
     timer.start()
     
     start_time = time()

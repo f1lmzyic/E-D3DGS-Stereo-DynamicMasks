@@ -135,6 +135,35 @@ def _build_image_lookup(images_root):
     return lookup
 
 
+def _build_image_sequence_lookup(images_root):
+    by_view = {}
+    for root, dirs, files in os.walk(images_root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() != ".ipynb_checkpoints"]
+        rel_parent = os.path.relpath(root, images_root)
+        parent_view = "" if rel_parent == "." else os.path.basename(rel_parent)
+        for file_name in files:
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext not in [".png", ".jpg", ".jpeg"]:
+                continue
+            if Path(file_name).stem.lower().endswith("-checkpoint"):
+                continue
+            parsed_view, frame = _parse_view_and_frame(file_name)
+            if frame is None:
+                continue
+            view = parent_view if parent_view else parsed_view
+            by_view.setdefault(view, {})[frame] = os.path.join(root, file_name)
+    return by_view
+
+
+def _nearest_frame_record(frame_map, frame):
+    if frame in frame_map:
+        return frame_map[frame]
+    if not frame_map:
+        return None
+    nearest = min(frame_map.keys(), key=lambda k: abs(k - frame))
+    return frame_map[nearest]
+
+
 def _parse_view_and_frame(file_name):
     stem = Path(file_name).stem
     match = re.match(r"^(.*?)(\d+)$", stem)
@@ -252,6 +281,7 @@ def readColmapCamerasDynerf(cam_extrinsics, cam_intrinsics, images_folder, near,
         return cam_infos
 
     image_lookup = _build_image_lookup(images_root)
+    image_sequences = _build_image_sequence_lookup(images_root)
     parsed = []
     for idx, key in enumerate(keys):
         image_name = cam_extrinsics[key].name
@@ -285,15 +315,17 @@ def readColmapCamerasDynerf(cam_extrinsics, cam_intrinsics, images_folder, near,
         frame_map = records_by_view[view_name]
         if len(frame_map) == 0:
             continue
-        available_frames = sorted(frame_map.keys())
-        fallback_key = available_frames[-1]
+        image_frame_map = image_sequences.get(view_name, {})
         for j in range(startime, startime + target_duration):
             sys.stdout.write('\r')
             sys.stdout.write("Reading camera {}/{}".format(view_idx+1, len(records_by_view)))
             sys.stdout.flush()
 
-            record = frame_map.get(j, frame_map[fallback_key])
+            record = _nearest_frame_record(frame_map, j)
+            if record is None:
+                continue
             extr, intr, image_path = record
+            image_path = image_frame_map.get(j, image_frame_map.get(j + frame_base, image_path))
             height = intr.height
             width = intr.width
             uid = view_to_uid[view_name]

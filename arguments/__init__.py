@@ -160,6 +160,12 @@ class OptimizationParams(ParamGroup):
         self.motion_prior_densify_grad_boost = 2.0
         self.lambda_stereo_consistency = 0.0
         self.stereo_baseline = 0.03
+        # Optional comma-separated curriculum for synthetic stereo training.
+        # Examples:
+        #   "0.3,0.6,1.0,1.5,2.0"              # spread across all iterations
+        #   "1:0.3,6000:0.6,12000:1.0,24000:2.0"  # explicit iter:baseline milestones
+        self.stereo_baseline_curriculum = ""
+        self.stereo_baseline_curriculum_mode = "linear"  # linear | step
         self.stereo_occlusion_tolerance = 0.01
         
         super().__init__(parser, "Optimization Parameters")
