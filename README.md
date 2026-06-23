@@ -1,128 +1,295 @@
-#  E-D3DGS : Embedding-Based Deformable 3D Gaussian Splatting (ECCV 2024)
+# E-D3DGS Stereo / Fast-Motion Pipeline
 
-[![arXiv](https://img.shields.io/badge/arXiv-2404.03613-006600)](https://arxiv.org/abs/2404.03613) 
-[![project_page](https://img.shields.io/badge/project_page-68BC71)](https://jeongminb.github.io/e-d3dgs/)
+This repository is a working fork of **E-D3DGS: Per-Gaussian Embedding-Based Deformation for Deformable 3D Gaussian Splatting**.  The current codebase focuses on training dynamic 3D Gaussians from COLMAP/SfM video scenes, with two project-specific additions:
 
-[Jeongmin Bae](https://jeongminb.github.io/)<sup>1*</sup>, [Seoha Kim](https://seoha-kim.github.io/)<sup>1*</sup>, [Youngsik Yun](https://bbangsik13.github.io/)<sup>1</sup>, </br>
-Hahyun Lee<sup>2 </sup>, Gun Bang<sup>2</sup>, [Youngjung Uh](https://github.com/yj-uh)<sup>1†</sup>
+- **Synthetic stereo rendering**: render a trained monocular/dynamic scene as left/right pairs by shifting the camera horizontally (`render_stereo.py`).
+- **Fast-motion motion priors**: optionally generate and use camera-compensated residual motion sidecars to focus supervision, sampling, and densification on moving regions (`script/generate_motion_priors.py`).
 
-<sup>1</sup>Yonsei University &emsp; <sup>2</sup>Electronics and Telecommunications Research Institute (ETRI)
-<br><sup>\*</sup> Equal Contributions &emsp; <sup>†</sup> Corresponding Author
+![Teaser](teaser.gif)
 
----
+## Repository layout
 
+| Path | Purpose |
+|---|---|
+| `train.py` | Main training entry point. Builds a `Scene`, optimizes the Gaussian cloud and deformation network, saves checkpoints. |
+| `render.py` | Monocular rendering for train/test/video camera sets. |
+| `render_stereo.py` | Synthetic stereo renderer. Writes left, right, side-by-side/anaglyph frames and MP4 videos. |
+| `metrics.py` | PSNR/SSIM/LPIPS plus temporal flicker, proxy TEPE, proxy stereo D1-all, and optional MUSIQ/IQ. |
+| `script/generate_motion_priors.py` | Generates `.npz` motion-prior sidecars from image sequences using Farneback or torchvision RAFT. |
+| `script/compare_stereo_depth_visuals.py` | Optional SGBM disparity/depth visualization for stereo outputs. |
+| `arguments/` | Legacy/default config files for DyNeRF, HyperNeRF/Nerfies, and Technicolor layouts. |
+| `scene/`, `gaussian_renderer/`, `utils/` | Dataset loading, Gaussian/deformation model, CUDA rasterization interface, losses, and helpers. |
+| `submodules/` | CUDA extensions: `diff-gaussian-rasterization` and `simple-knn`. |
+| `docs/pipeline_wireframe.md` | Development pipeline notes/diagram; the README reflects the current supported feature set. |
 
-Official repository for <a href="https://arxiv.org/abs/2404.03613">"Per-Gaussian Embedding-Based Deformation for Deformable 3D Gaussian Splatting"</a><be>. <br>
-Our approach employs per-Gaussian latent embeddings to predict deformation for each Gaussian and achieves a clearer representation of dynamic motion. <br>
-We uploaded the checkpoints, configs, and rendered videos for paper results [here](https://drive.google.com/drive/folders/1PAaIp5cNYNpLjQ5JX0SVLh5Yn_K9UmJd?usp=sharing).
+## Installation
 
-![Alt Text](https://github.com/JeongminB/E-D3DGS/blob/main/teaser.gif)
+A CUDA GPU is required for training and rendering. This project has been used with PyTorch 1.13.x and CUDA 11.x.
 
-## Environmental Setup
-Please follow the [3DGS](https://github.com/graphdeco-inria/gaussian-splatting) to install the relative packages.
 ```bash
-git clone https://github.com/JeongminB/E-D3DGS.git
-cd E-D3DGS
-git submodule update --init --recursive
+git clone <this-repo-url>
+cd E-D3DGS-Stereo-FastMotion-DynamicMasks
 
-conda create -n ed3dgs python=3.7 
-conda activate ed3dgs
+conda create -n ed3dgs-stereo python=3.10 -y
+conda activate ed3dgs-stereo
 
-# If submodules fail to be downloaded, refer to the repository of 3DGS  
 pip install -r requirements.txt
 pip install -e submodules/diff-gaussian-rasterization/
-pip install -e submodules/simple-knn/ 
+pip install -e submodules/simple-knn/
 ```
-We use `pytorch=1.13.1+cu116` in our environment.
 
+For stereo video encoding, install `ffmpeg` and make sure it is on `PATH`.
 
-## Data Preparation
+Optional extras:
 
-**Downloading Datasets:**  
-Please download datasets from their official websites : [HyperNerf](https://github.com/google/hypernerf/releases/tag/v0.1), [Neural 3D Video](https://github.com/facebookresearch/Neural_3D_Video) and [Technicolor](https://www.interdigital.com/data_sets/light-field-dataset) <br><br>
-- Please remove 'cam13.mp4' and corresponding pose from <i>coffee_martini</i> scene in the Neural 3D Video dataset. <br>
-- We split the entire <i>flame_salmon_1_split</i> scene into four 300-frame scenes.
+- `opencv-python` is needed for Farneback motion priors, stereo disparity comparison, and some proxy metrics.
+- `pyiqa` is needed only if using `metrics.py --compute_iq`.
+- torchvision RAFT motion priors require a torchvision version that provides `torchvision.models.optical_flow.raft_large` and the RAFT checkpoint cache.
 
-<br>
+## Expected data layout
 
-**Extracting point clouds from COLMAP:** 
+The current SK/indoor workflow uses a COLMAP or Nerfstudio-style scene folder:
+
+```text
+<scene>/
+├── images/
+│   ├── left/                 # or camXX/ folders, depending on the dataset
+│   │   ├── left000001.png
+│   │   └── ...
+│   └── right/                # optional; used as right-view GT by render_stereo.py
+│       ├── right000001.png
+│       └── ...
+├── ns_output/colmap/sparse/0/ # cameras.bin/images.bin/points3D.bin or .txt
+│   ├── cameras.bin
+│   ├── images.bin
+│   └── points3D.bin
+├── points3D_downsample.ply    # optional; generated from COLMAP points if absent
+└── motion_priors/             # optional sidecars generated by this repo
+    └── left/*.npz
+```
+
+The DyNeRF loader resolves COLMAP sparse models from these locations, in order:
+
+1. `colmap/dense/workspace/sparse`
+2. `ns_output/colmap/sparse/0`
+3. `ns_output/colmap/sparse_work/0`
+4. `ns_output/colmap/sparse`
+
+Point-cloud input is resolved from `points3D_downsample.ply`, `points3D.ply`, sparse `points3D.ply`, dense `fused.ply`, or converted from COLMAP `points3D.bin/.txt`.
+
+Legacy preprocessing helpers for Neural 3D Video, Technicolor, and HyperNeRF-style data remain in `script/pre_n3v.py`, `script/pre_technicolor.py`, `script/pre_hypernerf.py`, and `script/downsample_point.py`.
+
+## Motion-prior sidecars (optional)
+
+Motion priors are soft residual-motion confidence maps. They are not segmentation masks. The generator estimates optical flow, fits a global camera/parallax flow, and stores residual motion cues.
+
 ```bash
-# setup COLMAP 
-bash script/colmap_setup.sh
-conda activate colmapenv 
-
-# automatically extract the frames and reorginize them
-python script/pre_n3v.py --videopath <dataset>/<scene>
-python script/pre_technicolor.py --videopath <dataset>/<scene>
-python script/pre_hypernerf.py --videopath <dataset>/<scene>
-
-# downsample dense point clouds
-python script/downsample_point.py \
-<location>/<scene>/colmap/dense/workspace/fused.ply <location>/<scene>/points3D_downsample.ply
+python script/generate_motion_priors.py \
+  --source /path/to/scene \
+  --images images \
+  --output motion_priors \
+  --method farneback \
+  --percentile 98.5 \
+  --threshold 0.35 \
+  --overlay_dir motion_prior_overlays
 ```
 
+For RAFT via torchvision:
 
-After running COLMAP, Neural 3D Video and Technicolor datasets are orginized as follows:
+```bash
+python script/generate_motion_priors.py \
+  --source /path/to/scene \
+  --images images \
+  --output motion_priors \
+  --method raft_torchvision \
+  --device cuda \
+  --torch_home /path/to/torch/cache
 ```
-├── data
-│   | n3v
-│     ├── cook_spinach
-│       ├── colmap
-│       ├── images
-│           ├── cam01
-│               ├── 0000.png
-│               ├── 0001.png
-│               ├── ...
-│           ├── cam02
-│               ├── 0000.png
-│               ├── 0001.png
-│               ├── ...
-│     ├── cut_roasted_beef
-|     ├── ...
-```
+
+Each `.npz` sidecar contains:
+
+- `confidence`: soft residual-motion confidence in `[0, 1]`
+- `residual_mag`: residual optical-flow magnitude
+- `flow`: original optical flow
+- `camera_flow`: fitted global camera/parallax flow
 
 ## Training
 
-To resize the training image, modify `-r 2` in the command line.
-``` bash
-# Train
-python train.py -s $GT_PATH/$SCENE --configs arguments/$DATASET/$CONFIG.py --model_path $OUTPUT_PATH --expname $DATASET/$SCENE -r 2
-``` 
+Minimal DyNeRF/SK-style training:
+
+```bash
+python train.py \
+  -s /path/to/scene \
+  --loader dynerf \
+  --images images \
+  --model_path output/my-scene \
+  --expname dynerf/my-scene \
+  --iterations 30000 \
+  --maxtime 300 \
+  --total_num_frames 300 \
+  --max_points 350000 \
+  --c2f_temporal_iter 30000 \
+  -r 2
+```
+
+Useful training options:
+
+```bash
+# Use motion-prior sidecars during training
+--use_motion_priors \
+--motion_prior_dir motion_priors \
+--motion_prior_loss_weight 0.05 \
+--motion_prior_threshold 0.35 \
+--motion_prior_frame_sample_prob 0.25 \
+--use_motion_prior_densification \
+--motion_prior_densify_grad_boost 2.0
+
+# Add synthetic stereo consistency during training
+--lambda_stereo_consistency 0.05 \
+--stereo_baseline 0.3 \
+--stereo_occlusion_tolerance 0.01
+
+# Optional stereo baseline schedule
+--stereo_baseline_curriculum "0.3,0.6,1.0,1.5,2.0" \
+--stereo_baseline_curriculum_mode linear
+```
+
+The most important timing parameters should match the scene: set `--total_num_frames` and `--maxtime` to the number of frames you want to train over.
 
 ## Rendering
 
+### Monocular render
 
-``` bash
-# Render test view only
-python render.py --model_path $OUTPUT_PATH --configs arguments/$DATASET/$CONFIG.py --skip_train --skip_video
-
-# Render train view, test view, and spiral path
-python render.py --model_path $OUTPUT_PATH --configs arguments/$DATASET/$CONFIG.py
+```bash
+python render.py \
+  --model_path output/my-scene \
+  --skip_test \
+  --skip_video
 ```
 
-## Evaluation
-Note: In our paper, we calculate FPS by measuring rendering time only (except for save_image, etc.).
-``` bash
-# Evaluate
-python metrics.py --model_path $SAVE_PATH/$DATASET/$CONFIG
+Outputs are written under:
+
+```text
+output/my-scene/train/ours_<iteration>/renders/
+output/my-scene/train/ours_<iteration>/gt/
+output/my-scene/train/ours_<iteration>/video_rgb.mp4
 ```
 
-## Note
+### Synthetic stereo render
 
-* We provide scripts that collectively perform training, rendering, and evaluation. See the `train_<dataset_name>.sh`. 
-* You will need to configure the dataset path according to your system.
-* In the config file, make sure that the `total_num_frames` and `maxtime` are equal to the total number of training frames.
+```bash
+python render_stereo.py \
+  --model_path output/my-scene \
+  --ipd 0.12 \
+  --convergence_distance 0.0 \
+  --output_format side_by_side \
+  --gt_source_path /path/to/scene \
+  --fps 30
+```
+
+`--output_format` can be `side_by_side`, `anaglyph`, or `separate`. If `<scene>/images/right` exists, it is copied as right-view GT and right-view PSNR/comparison videos are produced when frame IDs can be matched.
+
+Stereo outputs are written under:
+
+```text
+output/my-scene/<split>/stereo_<iteration>/
+├── gt/                         # left GT
+├── gt_right/                   # optional right GT
+└── renders/
+    ├── left/
+    ├── right/
+    ├── stereo/
+    ├── metrics.json
+    └── *.mp4
+```
+
+## Metrics
+
+```bash
+python metrics.py \
+  -m output/my-scene \
+  --dataset_root /path/to/dataset/root \
+  --device cuda:0
+```
+
+Common options:
+
+```bash
+--compute_iq              # optional MUSIQ/IQ via pyiqa
+--no_tf                   # disable temporal flicker score
+--no_proxy_tepe           # disable proxy temporal optical-flow endpoint error
+--no_proxy_d1             # disable proxy stereo D1-all
+--gt_flow_dir DIR         # provide GT flow files manually
+--no_auto_motion_priors   # disable auto-discovery of motion_priors flow files
+```
+
+Results are written to `results.json` and `per_view.json` in the model directory.
+
+## All-in-one SK indoor runner
+
+`run_ed3dgs_dynamic_masks_train_render_stereo_interactive.sh` is the current batch runner despite its historical name. It can generate motion priors, train, render, stereo-render, and optionally run metrics.
+
+```bash
+bash run_ed3dgs_dynamic_masks_train_render_stereo_interactive.sh video016
+```
+
+Useful environment overrides:
+
+```bash
+DATASET_ROOT=/path/to/datasets/SK/indoor \
+OUTPUT_PREFIX=ed3dgs-no-masks-stereo-reg-raft-motion-priors-indoor \
+GENERATE_MOTION_PRIORS=1 \
+USE_MOTION_PRIORS=1 \
+MOTION_PRIOR_METHOD=raft_torchvision \
+MOTION_PRIOR_DEVICE=cuda \
+RUN_TRAIN=1 RUN_RENDER=1 RUN_STEREO=1 \
+IPD=1.4 \
+bash run_ed3dgs_dynamic_masks_train_render_stereo_interactive.sh video016
+```
+
+For metrics over multiple output folders, edit `MODEL_DIRS` in `run_metrics_batch.sh` and run:
+
+```bash
+bash run_metrics_batch.sh
+```
+
+## Checkpoints and outputs
+
+Training creates:
+
+```text
+output/<run>/
+├── cfg_args
+├── cameras.json
+├── input.ply
+├── training_time.txt
+└── point_cloud/iteration_<N>/
+    ├── point_cloud.ply
+    └── deformation.pth
+```
+
+`render.py` and `render_stereo.py` load the latest checkpoint by default with `--iteration -1`.
 
 ## Acknowledgements
 
-This code is based on [3DGS](https://github.com/graphdeco-inria/gaussian-splatting), [4DGaussians](https://github.com/hustvl/4DGaussians) and [STG](https://github.com/oppo-us-research/SpacetimeGaussians). In particular, we used [4DGaussians](https://github.com/hustvl/4DGaussians) as a starting point for our study. We would like to thank the authors of these papers for their hard work. 😊
+This project builds on:
 
-## BibTex
-```
+- [E-D3DGS](https://github.com/JeongminB/E-D3DGS)
+- [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
+- [4DGaussians](https://github.com/hustvl/4DGaussians)
+- [SpacetimeGaussians](https://github.com/oppo-us-research/SpacetimeGaussians)
+
+Please check `LICENSE.md`; this code inherits the non-commercial research/evaluation licensing terms from the upstream Gaussian Splatting code.
+
+## Citation
+
+If you use the E-D3DGS method, cite the upstream paper:
+
+```bibtex
 @inproceedings{bae2024ed3dgs,
-    title={Per-Gaussian Embedding-Based Deformation for Deformable 3D Gaussian Splatting}, 
-    author={Bae, Jeongmin and Kim, Seoha and Yun, Youngsik and Lee, Hahyun and Bang, Gun and Uh, Youngjung}, 
-    booktitle = {European Conference on Computer Vision (ECCV)},
+    title={Per-Gaussian Embedding-Based Deformation for Deformable 3D Gaussian Splatting},
+    author={Bae, Jeongmin and Kim, Seoha and Yun, Youngsik and Lee, Hahyun and Bang, Gun and Uh, Youngjung},
+    booktitle={European Conference on Computer Vision (ECCV)},
     year={2024}
 }
 ```
